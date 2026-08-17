@@ -55,6 +55,7 @@ OUTPUTS: Final = PROJECT_DIR / "outputs"
 MODEL_METRICS_PATH: Final = OUTPUTS / "metrics.json"
 MODEL_COEFFICIENTS_PATH: Final = OUTPUTS / "coefficients.csv"
 MODEL_PREDICTIONS_PATH: Final = OUTPUTS / "predictions.csv"
+PREDICTION_VISUALIZER_PATH: Final = OUTPUTS / "prediction_visualizer.ipynb"
 
 # Network configuration. Never put the actual API key in this file.
 FRED_API_KEY_ENV: Final = "FRED_API_KEY"

@@ -38,6 +38,7 @@ not used as model input.
 - [Model design](#model-design)
 - [Generated artifacts](#generated-artifacts)
 - [Accuracy report](#accuracy-report)
+- [Prediction visualizer](#prediction-visualizer)
 - [Supplementary scraping](#supplementary-scraping)
 - [Validation and leakage controls](#validation-and-leakage-controls)
 - [Known limitations](#known-limitations)
@@ -145,6 +146,8 @@ FED_decision_predictor/
 |  |- features.py                  # leakage-controlled feature engineering
 |  |- model.py                     # hierarchical models and evaluation
 |  |- pipeline.py                  # configured end-to-end orchestration
+|  |- clean_data_and_outputs.py    # remove generated files, preserve directories
+|  |- build_prediction_visualizer.py # executed prediction charts notebook
 |  |- build_accuracy_report.py     # notebook, JSON report, and HTML report
 |  |- check_links.py               # unfinished supplementary-link QA scaffold
 |  |- fed_rate_prediction_resources.csv
@@ -179,15 +182,8 @@ python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 ```
 
-The core requirements include pandas, NumPy, scikit-learn, requests,
-Beautiful Soup, lxml, and python-dotenv.
-
-The optional executed-notebook report also needs `nbformat`, `nbclient`, and an
-available Jupyter kernel. If they are not already installed:
-
-```bash
-python3 -m pip install nbformat nbclient ipykernel
-```
+The requirements include pandas, NumPy, scikit-learn, requests, Beautiful Soup,
+lxml, python-dotenv, Matplotlib, nbformat, nbclient, and an IPython kernel.
 
 ### Configure the FRED key
 
@@ -265,6 +261,7 @@ python3 pull_from_apis.py
 python3 clean.py
 python3 features.py
 python3 model.py
+python3 build_prediction_visualizer.py
 python3 build_accuracy_report.py
 ```
 
@@ -276,6 +273,7 @@ Stage dependencies are strict:
 | `clean.py` | Complete raw inputs | `clean_panel.csv` |
 | `features.py` | Clean panel plus raw histories | `feature_panel.csv` |
 | `model.py` | Feature panel | Metrics, coefficients, predictions |
+| `build_prediction_visualizer.py` | Predictions and clean panel | Executed visualization notebook |
 | `build_accuracy_report.py` | Model outputs and feature panel | Notebook, report JSON, HTML |
 
 ### Structured acquisition options
@@ -298,6 +296,19 @@ Available options:
 - `--end-year`: final calendar year to parse.
 
 Prefer `.env` over `--api-key` for normal use.
+
+### Remove generated data and outputs
+
+To delete acquired data, cleaned panels, model outputs, and generated reports:
+
+```bash
+python3 clean_data_and_outputs.py
+```
+
+This is destructive. It cleans only the configured `data/raw`, `data/clean`,
+and `outputs` directories, refuses symlinked or unapproved targets, and preserves
+their `.gitkeep` files. Source code, configuration, `.env`, and documentation
+are not removed.
 
 ## Cleaning and labels
 
@@ -606,6 +617,40 @@ python3 build_accuracy_report.py
 The HTML is deterministic: if the model artifacts are unchanged, its content
 may have the same hash even though the file was regenerated. The charts change
 when the data in `metrics.json` or `predictions.csv` changes.
+
+## Prediction visualizer
+
+After `model.py` has produced `predictions.csv`, run:
+
+```bash
+python3 build_prediction_visualizer.py
+```
+
+This generates and executes:
+
+```text
+contents/outputs/prediction_visualizer.ipynb
+```
+
+The notebook contains three reader-facing visualizations:
+
+1. **Interest-rate path:** the official post-meeting target midpoint, with
+   markers for predicted cut, hold, and hike decisions.
+2. **Unemployment path:** aligned unemployment and the CBO natural-rate
+   estimate, with the same prediction markers.
+3. **Three-class confusion matrix:** a 3×3 color-scale matrix whose rows are
+   actual cut/hold/hike decisions, columns are predicted decisions, and every
+   square displays the exact number of meetings.
+
+Marker shape reinforces marker color, and incorrect class predictions receive
+a dark open ring. The time-series markers visualize the predicted decision
+class at the observed economic value; they are not predictions of the numeric
+interest-rate or unemployment level.
+
+The builder validates source schemas, probability sums, unique meeting dates,
+the confusion-matrix total, and all notebook cell outputs. It refuses to create
+a partially executed notebook and tells you to run the upstream pipeline when
+the required artifacts are missing.
 
 ## Supplementary scraping
 
