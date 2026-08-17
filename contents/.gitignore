@@ -1,0 +1,14 @@
+data/raw/*
+data/clean/*
+outputs/*
+!data/raw/.gitkeep
+!data/clean/.gitkeep
+!outputs/.gitkeep
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
