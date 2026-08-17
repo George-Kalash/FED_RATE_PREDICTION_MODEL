@@ -1,12 +1,9 @@
-"""Stage 4: train and evaluate Fed decision logistic-regression models.
+"""Stage 4: train a leakage-aware hierarchical FOMC decision model.
 
-Train two models from the same feature panel:
-
-- primary: binary ``is_change`` (hold versus hike/cut)
-- diagnostic: three-class ``decision`` (cut, hold, hike)
-
-The scaler must be fitted inside each cross-validation fold, so it belongs in a
-scikit-learn ``Pipeline`` with logistic regression.
+The model first estimates hold versus change.  Conditional on a change, a
+second logistic regression estimates cut versus hike.  A decision policy whose
+thresholds are selected only from chronological training-fold predictions then
+combines the two probabilities and records every override in predictions.csv.
 """
 
 from __future__ import annotations
@@ -16,8 +13,9 @@ import math
 import os
 import tempfile
 from datetime import datetime, timezone
+from itertools import product
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
@@ -39,132 +37,74 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from config import (
+    CHANGE_THRESHOLD_VALUES,
+    CUT_OVERRIDE_DIRECTION_VALUES,
+    CUT_OVERRIDE_JOINT_VALUES,
+    CUT_OVERRIDE_MIN_CHANGE_VALUES,
+    CV_SPLITS,
     DECISION_CLASSES,
+    DECISION_POLICY_SCORING,
+    DIAGNOSTIC_MODEL_SCORING,
     DIAGNOSTIC_TARGET,
+    DIRECTION_CUT_THRESHOLD_VALUES,
+    DIRECTION_CUT_WEIGHT_OPTIONS,
+    DIRECTION_TARGET,
     FEATURE_COLUMNS,
     FEATURE_PANEL_PATH,
-    CV_SPLITS,
     LOGISTIC_C_VALUES,
     LOGISTIC_MAX_ITERATIONS,
     MODEL_COEFFICIENTS_PATH,
     MODEL_METRICS_PATH,
     MODEL_PREDICTIONS_PATH,
+    MODEL_SELECTION_SCORE_TOLERANCE,
     MODEL_TEST_FRACTION,
-    PRIMARY_TARGET,
+    PRIMARY_CLASS_WEIGHT_OPTIONS,
     PRIMARY_MODEL_SCORING,
-    DIAGNOSTIC_MODEL_SCORING,
+    PRIMARY_TARGET,
     RANDOM_STATE,
 )
 from features import validate_feature_panel
 
 
-def _warning_free_balanced_accuracy(
-    y_true: "pd.Series | np.ndarray",
-    y_pred: "pd.Series | np.ndarray",
+def _json_ready(value: Any) -> Any:
+    """Recursively convert numpy values and mapping keys for JSON."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def _observed_class_balanced_accuracy(
+    y_true: pd.Series | np.ndarray,
+    y_pred: pd.Series | np.ndarray,
 ) -> float:
-    """Compute mean recall over observed classes, including one-class folds."""
-    true_values = np.asarray(y_true)
-    predicted_values = np.asarray(y_pred)
-    observed_classes = np.unique(true_values)
-    if observed_classes.size == 0:
-        raise ValueError("Balanced accuracy requires at least one observation")
-    recalls = [
-        np.mean(predicted_values[true_values == label] == label)
-        for label in observed_classes
-    ]
-    return float(np.mean(recalls))
-
-
-def _unwrap_pipeline(fitted_estimator: Any) -> Pipeline:
-    """Return the fitted pipeline inside a search object or direct pipeline."""
-    candidate = getattr(fitted_estimator, "best_estimator_", fitted_estimator)
-    if not isinstance(candidate, Pipeline):
-        raise TypeError("fitted_estimator must contain a fitted sklearn Pipeline")
-    if "logistic_regression" not in candidate.named_steps:
-        raise ValueError("Pipeline does not contain logistic_regression")
-    classifier = candidate.named_steps["logistic_regression"]
-    if not hasattr(classifier, "classes_"):
-        raise ValueError("Logistic-regression pipeline has not been fitted")
-    return candidate
-
-
-def _json_value(value: Any) -> Any:
-    """Convert a numpy scalar to its JSON-compatible Python equivalent."""
-    return value.item() if isinstance(value, np.generic) else value
-
-
-def load_feature_panel() -> "pd.DataFrame":
-    """Load and validate the chronological feature panel.
-
-    The input location is fixed by ``config.FEATURE_PANEL_PATH``.
-    """
-    if not FEATURE_PANEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Feature panel does not exist: {FEATURE_PANEL_PATH}. "
-            "Run features.py first."
+    """Calculate mean recall without warning on one-class validation windows."""
+    truth = np.asarray(y_true)
+    predicted = np.asarray(y_pred)
+    observed = np.unique(truth)
+    return float(
+        np.mean(
+            [
+                np.mean(predicted[truth == label] == label)
+                for label in observed
+            ]
         )
-    panel = pd.read_csv(FEATURE_PANEL_PATH)
-    panel["meeting_date"] = pd.to_datetime(panel["meeting_date"], errors="coerce")
-    validate_feature_panel(panel)
-    return panel
+    )
 
 
-def chronological_train_test_split(
-    panel: "pd.DataFrame",
-) -> tuple["pd.DataFrame", "pd.DataFrame"]:
-    """Split older meetings into train and newer meetings into test.
-
-    The holdout fraction comes from ``config.MODEL_TEST_FRACTION``. Both targets
-    must have every declared class in both partitions so their holdout metrics
-    remain meaningful. The test partition is never used during tuning.
-    """
-    if not isinstance(panel, pd.DataFrame):
-        raise TypeError("panel must be a pandas DataFrame")
-    validate_feature_panel(panel)
-    if not 0 < MODEL_TEST_FRACTION < 1:
-        raise ValueError("MODEL_TEST_FRACTION must be strictly between 0 and 1")
-
-    test_size = math.ceil(len(panel) * MODEL_TEST_FRACTION)
-    split_position = len(panel) - test_size
-    if split_position <= 0:
-        raise ValueError("Feature panel is too small for the configured holdout")
-
-    train = panel.iloc[:split_position].copy().reset_index(drop=True)
-    test = panel.iloc[split_position:].copy().reset_index(drop=True)
-    if train.empty or test.empty:
-        raise ValueError("Chronological split produced an empty partition")
-    if train["meeting_date"].max() >= test["meeting_date"].min():
-        raise ValueError("Train/test dates overlap or are not strictly chronological")
-
-    required_classes: dict[str, set[Any]] = {
-        PRIMARY_TARGET: {0, 1},
-        DIAGNOSTIC_TARGET: set(DECISION_CLASSES),
-    }
-    for target_name, expected in required_classes.items():
-        for partition_name, partition in (("train", train), ("test", test)):
-            observed = set(partition[target_name].tolist())
-            missing = sorted(expected - observed, key=str)
-            if missing:
-                raise ValueError(
-                    f"{partition_name} partition lacks {target_name} classes: {missing}"
-                )
-    return train, test
-
-
-def make_estimator(*, multiclass: bool) -> "Pipeline":
-    """Declare ``StandardScaler`` followed by ``LogisticRegression``.
-
-    ``lbfgs`` supports binary and multinomial logistic regression. Modern
-    scikit-learn selects the multiclass behavior from the observed target.
-    """
-    if not isinstance(multiclass, bool):
-        raise TypeError("multiclass must be a boolean")
+def _pipeline(*, class_weight: Any = None, C: float = 1.0) -> Pipeline:
+    """Create the scaler/model pipeline used in every fit."""
     return Pipeline(
-        steps=[
+        [
             ("scaler", StandardScaler()),
             (
                 "logistic_regression",
                 LogisticRegression(
+                    C=C,
+                    class_weight=class_weight,
                     solver="lbfgs",
                     max_iter=LOGISTIC_MAX_ITERATIONS,
                     random_state=RANDOM_STATE,
@@ -174,580 +114,827 @@ def make_estimator(*, multiclass: bool) -> "Pipeline":
     )
 
 
-def tune_estimator(
-    estimator: "Pipeline",
-    X_train: "pd.DataFrame",
-    y_train: "pd.Series",
-    *,
-    scoring: str,
-) -> Any:
-    """Tune logistic-regression C using chronological five-fold validation.
-
-    Fold width is reduced when necessary so the earliest training prefix already
-    contains every class observed in ``y_train``. This preserves five forward
-    splits while avoiding invalid one-class logistic-regression fits.
-    """
-    if not isinstance(estimator, Pipeline):
-        raise TypeError("estimator must be a scikit-learn Pipeline")
-    if not isinstance(X_train, pd.DataFrame):
-        raise TypeError("X_train must be a pandas DataFrame")
-    if not isinstance(y_train, pd.Series):
-        raise TypeError("y_train must be a pandas Series")
-    if len(X_train) != len(y_train) or X_train.empty:
-        raise ValueError("X_train and y_train must be non-empty and equally sized")
-    if not isinstance(scoring, str) or not scoring.strip():
-        raise ValueError("scoring must be a non-empty sklearn scoring name")
-
-    numeric_X = X_train.apply(pd.to_numeric, errors="coerce")
-    values = numeric_X.to_numpy(dtype=float)
-    if np.isnan(values).any() or not np.isfinite(values).all():
-        raise ValueError("X_train contains missing or non-finite features")
-    if y_train.isna().any():
-        raise ValueError("y_train contains missing targets")
-
-    required_classes = set(y_train.tolist())
-    if len(required_classes) < 2:
-        raise ValueError("y_train must contain at least two classes")
-    minimum_initial_size: int | None = None
-    for prefix_size in range(2, len(y_train) + 1):
-        if set(y_train.iloc[:prefix_size].tolist()) == required_classes:
-            minimum_initial_size = prefix_size
+def _class_complete_cv(y: pd.Series) -> TimeSeriesSplit:
+    """Return forward folds whose training prefix contains all target classes."""
+    if len(y) < CV_SPLITS + 2 or y.nunique() < 2:
+        raise ValueError("Target is too short or contains fewer than two classes")
+    required = set(y.tolist())
+    first_complete: int | None = None
+    for size in range(2, len(y) + 1):
+        if set(y.iloc[:size]) == required:
+            first_complete = size
             break
-    if minimum_initial_size is None:
-        raise ValueError("Could not find a training prefix containing every class")
-
-    maximum_test_size = (
-        len(y_train) - minimum_initial_size
-    ) // CV_SPLITS
+    if first_complete is None:
+        raise ValueError("No training prefix contains all target classes")
+    maximum_test_size = (len(y) - first_complete) // CV_SPLITS
     if maximum_test_size < 1:
-        raise ValueError(
-            "Training data is too short for chronological CV after all classes appear"
+        raise ValueError("Not enough rows for class-complete chronological CV")
+    test_size = min(len(y) // (CV_SPLITS + 1), maximum_test_size)
+    splitter = TimeSeriesSplit(n_splits=CV_SPLITS, test_size=test_size)
+    for train_index, _ in splitter.split(y):
+        if set(y.iloc[train_index]) != required:
+            raise ValueError("A chronological CV training fold lacks a class")
+    return splitter
+
+
+def load_feature_panel() -> pd.DataFrame:
+    """Load the configured feature panel."""
+    if not FEATURE_PANEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Missing {FEATURE_PANEL_PATH}; run features.py first"
         )
-    default_test_size = len(y_train) // (CV_SPLITS + 1)
-    fold_test_size = min(default_test_size, maximum_test_size)
-    cross_validation = TimeSeriesSplit(
-        n_splits=CV_SPLITS,
-        test_size=fold_test_size,
-    )
-    for train_indices, _ in cross_validation.split(numeric_X):
-        observed = set(y_train.iloc[train_indices].tolist())
-        if observed != required_classes:
-            missing = sorted(required_classes - observed, key=str)
-            raise ValueError(f"A CV training fold lacks target classes: {missing}")
+    panel = pd.read_csv(FEATURE_PANEL_PATH)
+    panel["meeting_date"] = pd.to_datetime(panel["meeting_date"], errors="coerce")
+    validate_feature_panel(panel)
+    return panel
 
-    search_scoring: Any = scoring
+
+def chronological_train_test_split(
+    panel: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reserve the newest configured fraction as a never-tuned holdout."""
+    validate_feature_panel(panel)
+    if not 0 < MODEL_TEST_FRACTION < 1:
+        raise ValueError("MODEL_TEST_FRACTION must be between zero and one")
+    test_size = math.ceil(len(panel) * MODEL_TEST_FRACTION)
+    split = len(panel) - test_size
+    train = panel.iloc[:split].copy().reset_index(drop=True)
+    test = panel.iloc[split:].copy().reset_index(drop=True)
+    if train.empty or test.empty or train.meeting_date.max() >= test.meeting_date.min():
+        raise ValueError("Chronological train/test split is invalid")
+    for name, part in (("train", train), ("test", test)):
+        if set(part[PRIMARY_TARGET]) != {0, 1}:
+            raise ValueError(f"{name} lacks a binary target class")
+        if set(part[DIAGNOSTIC_TARGET]) != set(DECISION_CLASSES):
+            raise ValueError(f"{name} lacks a decision class")
+    return train, test
+
+
+def _tune_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    *,
+    class_weights: Iterable[Any],
+    scoring: str,
+) -> GridSearchCV:
+    """Tune regularization and class weights with chronological CV."""
+    if X.empty or len(X) != len(y) or X.isna().any().any():
+        raise ValueError("Training features/target are empty, unequal, or missing")
+    scorer: Any = scoring
     if scoring == "balanced_accuracy":
-        search_scoring = make_scorer(_warning_free_balanced_accuracy)
-
+        scorer = make_scorer(_observed_class_balanced_accuracy)
     search = GridSearchCV(
-        estimator=estimator,
-        param_grid={"logistic_regression__C": list(LOGISTIC_C_VALUES)},
-        scoring=search_scoring,
-        cv=cross_validation,
+        _pipeline(),
+        {
+            "logistic_regression__C": list(LOGISTIC_C_VALUES),
+            "logistic_regression__class_weight": list(class_weights),
+        },
+        scoring=scorer,
+        cv=_class_complete_cv(y.reset_index(drop=True)),
         refit=True,
         error_score="raise",
-        return_train_score=False,
     )
-    search.fit(numeric_X, y_train)
+    search.fit(X, y)
     return search
 
 
-def evaluate_classifier(
-    fitted_estimator: Any,
-    X_test: "pd.DataFrame",
-    y_test: "pd.Series",
-) -> dict[str, Any]:
-    """Return JSON-serializable holdout metrics.
+def _positive_probability(estimator: Any, X: pd.DataFrame, label: Any) -> np.ndarray:
+    """Return the probability column for a named class."""
+    pipeline = getattr(estimator, "best_estimator_", estimator)
+    classes = list(pipeline.named_steps["logistic_regression"].classes_)
+    if label not in classes:
+        raise ValueError(f"Estimator does not contain class {label!r}: {classes}")
+    return pipeline.predict_proba(X)[:, classes.index(label)]
 
-    Include the holdout date range outside this helper, where meeting dates are
-    still available alongside the feature matrix.
-    """
-    if not isinstance(X_test, pd.DataFrame):
-        raise TypeError("X_test must be a pandas DataFrame")
-    if not isinstance(y_test, pd.Series):
-        raise TypeError("y_test must be a pandas Series")
-    if len(X_test) != len(y_test) or X_test.empty:
-        raise ValueError("X_test and y_test must be non-empty and equally sized")
-    values = X_test.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    if np.isnan(values).any() or not np.isfinite(values).all():
-        raise ValueError("X_test contains missing or non-finite features")
-    if y_test.isna().any():
-        raise ValueError("y_test contains missing targets")
 
-    pipeline = _unwrap_pipeline(fitted_estimator)
-    classifier = pipeline.named_steps["logistic_regression"]
-    labels = [_json_value(value) for value in classifier.classes_]
-    predictions = pipeline.predict(X_test)
-    majority_class = y_test.value_counts().idxmax()
-    majority_predictions = np.full(len(y_test), majority_class)
+def _fixed_pipeline(best_parameters: dict[str, Any]) -> Pipeline:
+    """Recreate a tuned pipeline for an out-of-fold fit."""
+    return _pipeline(
+        C=float(best_parameters["logistic_regression__C"]),
+        class_weight=best_parameters["logistic_regression__class_weight"],
+    )
 
-    class_counts = y_test.value_counts().reindex(classifier.classes_, fill_value=0)
-    metrics: dict[str, Any] = {
-        "sample_count": int(len(y_test)),
-        "class_counts": {
-            str(_json_value(label)): int(count)
-            for label, count in class_counts.items()
+
+def _make_oof_probabilities(
+    train: pd.DataFrame,
+    primary_parameters: dict[str, Any],
+    direction_parameters: dict[str, Any],
+) -> pd.DataFrame:
+    """Generate forward-only probabilities used to select policy thresholds."""
+    X = train.loc[:, FEATURE_COLUMNS]
+    y_change = train[PRIMARY_TARGET].astype(int)
+    probabilities = pd.DataFrame(
+        {
+            "actual_decision": train[DIAGNOSTIC_TARGET].astype(str),
+            "probability_change": np.nan,
+            "probability_cut_given_change": np.nan,
         },
-        "labels": labels,
-        "accuracy": float(accuracy_score(y_test, predictions)),
-        "balanced_accuracy": float(
-            balanced_accuracy_score(y_test, predictions)
+        index=train.index,
+    )
+    for fit_index, validation_index in _class_complete_cv(y_change).split(X):
+        primary = _fixed_pipeline(primary_parameters)
+        primary.fit(X.iloc[fit_index], y_change.iloc[fit_index])
+        probabilities.loc[validation_index, "probability_change"] = (
+            _positive_probability(primary, X.iloc[validation_index], 1)
+        )
+
+        direction_train = train.iloc[fit_index]
+        direction_train = direction_train.loc[direction_train[PRIMARY_TARGET].eq(1)]
+        direction_y = direction_train[DIAGNOSTIC_TARGET].astype(str)
+        if set(direction_y) != {"cut", "hike"}:
+            raise ValueError("An OOF direction-training fold lacks cut or hike")
+        direction = _fixed_pipeline(direction_parameters)
+        direction.fit(direction_train.loc[:, FEATURE_COLUMNS], direction_y)
+        probabilities.loc[validation_index, "probability_cut_given_change"] = (
+            _positive_probability(direction, X.iloc[validation_index], "cut")
+        )
+    complete = probabilities.dropna().copy()
+    if complete.empty:
+        raise ValueError("Chronological CV produced no policy-training predictions")
+    return complete.reset_index(drop=True)
+
+
+def apply_decision_policy(
+    probability_change: np.ndarray,
+    probability_cut_given_change: np.ndarray,
+    thresholds: dict[str, float],
+) -> pd.DataFrame:
+    """Combine model probabilities and apply the auditable obvious-cut rule."""
+    p_change = np.asarray(probability_change, dtype=float)
+    p_cut_direction = np.asarray(probability_cut_given_change, dtype=float)
+    if p_change.shape != p_cut_direction.shape or p_change.ndim != 1:
+        raise ValueError("Policy probability arrays must be equal one-dimensional arrays")
+    if (
+        np.isnan(p_change).any()
+        or np.isnan(p_cut_direction).any()
+        or np.any((p_change < 0) | (p_change > 1))
+        or np.any((p_cut_direction < 0) | (p_cut_direction > 1))
+    ):
+        raise ValueError("Policy probabilities must be finite values from zero to one")
+
+    required = {
+        "change_threshold",
+        "direction_cut_threshold",
+        "override_min_change_probability",
+        "override_min_direction_cut_probability",
+        "override_min_joint_cut_probability",
+    }
+    if set(thresholds) != required:
+        raise ValueError(f"Policy thresholds must be exactly {sorted(required)}")
+
+    predicted_change = p_change >= thresholds["change_threshold"]
+    predicted_direction = np.where(
+        p_cut_direction >= thresholds["direction_cut_threshold"], "cut", "hike"
+    )
+    raw_decision = np.where(predicted_change, predicted_direction, "hold")
+    p_cut = p_change * p_cut_direction
+    p_hike = p_change * (1.0 - p_cut_direction)
+    p_hold = 1.0 - p_change
+
+    obvious_cut = (
+        (p_change >= thresholds["override_min_change_probability"])
+        & (
+            p_cut_direction
+            >= thresholds["override_min_direction_cut_probability"]
+        )
+        & (p_cut >= thresholds["override_min_joint_cut_probability"])
+    )
+    final_decision = np.where(obvious_cut, "cut", raw_decision)
+    override = obvious_cut & (raw_decision != "cut")
+    reason = np.where(
+        override,
+        "cut probabilities exceeded all training-selected override gates",
+        "",
+    )
+    return pd.DataFrame(
+        {
+            "raw_predicted_is_change": predicted_change.astype("int8"),
+            "raw_direction": predicted_direction,
+            "raw_model_decision": raw_decision,
+            "final_decision": final_decision,
+            "probability_change": p_change,
+            "probability_cut_given_change": p_cut_direction,
+            "probability_hike_given_change": 1.0 - p_cut_direction,
+            "probability_cut": p_cut,
+            "probability_hold": p_hold,
+            "probability_hike": p_hike,
+            "obvious_cut_signal": obvious_cut,
+            "cut_override_triggered": override,
+            "override_reason": reason,
+        }
+    )
+
+
+def _policy_score(y_true: pd.Series, y_pred: pd.Series) -> float:
+    """Score the decision policy using the configured training objective."""
+    if DECISION_POLICY_SCORING != "f1_macro":
+        raise ValueError(
+            "Only f1_macro is currently implemented for DECISION_POLICY_SCORING"
+        )
+    return float(f1_score(y_true, y_pred, labels=DECISION_CLASSES, average="macro"))
+
+
+def select_decision_policy(oof: pd.DataFrame) -> tuple[dict[str, float], dict[str, Any]]:
+    """Select all decision and override thresholds from training OOF rows."""
+    required = {
+        "actual_decision",
+        "probability_change",
+        "probability_cut_given_change",
+    }
+    if not required.issubset(oof.columns) or oof.empty:
+        raise ValueError("OOF policy data is missing required columns")
+    y = oof["actual_decision"].astype(str)
+    if set(y) != set(DECISION_CLASSES):
+        raise ValueError("OOF policy rows do not contain every decision class")
+
+    best_thresholds: dict[str, float] | None = None
+    best_policy: pd.DataFrame | None = None
+    best_rank: tuple[float, float, float, float, int] | None = None
+    for values in product(
+        CHANGE_THRESHOLD_VALUES,
+        DIRECTION_CUT_THRESHOLD_VALUES,
+        CUT_OVERRIDE_MIN_CHANGE_VALUES,
+        CUT_OVERRIDE_DIRECTION_VALUES,
+        CUT_OVERRIDE_JOINT_VALUES,
+    ):
+        thresholds = {
+            "change_threshold": float(values[0]),
+            "direction_cut_threshold": float(values[1]),
+            "override_min_change_probability": float(values[2]),
+            "override_min_direction_cut_probability": float(values[3]),
+            "override_min_joint_cut_probability": float(values[4]),
+        }
+        policy = apply_decision_policy(
+            oof["probability_change"].to_numpy(),
+            oof["probability_cut_given_change"].to_numpy(),
+            thresholds,
+        )
+        predicted = policy["final_decision"]
+        cut_mask = y.eq("cut")
+        cut_recall = float(predicted[cut_mask].eq("cut").mean())
+        rank = (
+            _policy_score(y, predicted),
+            cut_recall,
+            float(balanced_accuracy_score(y, predicted)),
+            float(accuracy_score(y, predicted)),
+            -int(policy["cut_override_triggered"].sum()),
+        )
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_thresholds = thresholds
+            best_policy = policy
+    if best_thresholds is None or best_policy is None or best_rank is None:
+        raise RuntimeError("Decision-policy search evaluated no candidates")
+    audit = {
+        "selection_source": "chronological training out-of-fold predictions",
+        "sample_count": int(len(oof)),
+        "scoring": DECISION_POLICY_SCORING,
+        "macro_f1": best_rank[0],
+        "cut_recall": best_rank[1],
+        "balanced_accuracy": best_rank[2],
+        "accuracy": best_rank[3],
+        "override_count": int(best_policy["cut_override_triggered"].sum()),
+        "candidates_evaluated": int(
+            len(CHANGE_THRESHOLD_VALUES)
+            * len(DIRECTION_CUT_THRESHOLD_VALUES)
+            * len(CUT_OVERRIDE_MIN_CHANGE_VALUES)
+            * len(CUT_OVERRIDE_DIRECTION_VALUES)
+            * len(CUT_OVERRIDE_JOINT_VALUES)
         ),
+    }
+    return best_thresholds, audit
+
+
+def _select_primary_model_and_policy(
+    train: pd.DataFrame,
+    primary_search: GridSearchCV,
+    direction_parameters: dict[str, Any],
+) -> tuple[GridSearchCV, dict[str, float], dict[str, Any]]:
+    """Jointly choose the change model and policy on forward training predictions."""
+    candidates: list[
+        tuple[dict[str, Any], dict[str, float], dict[str, Any]]
+    ] = []
+    for C, class_weight in product(
+        LOGISTIC_C_VALUES, PRIMARY_CLASS_WEIGHT_OPTIONS
+    ):
+        parameters = {
+            "logistic_regression__C": float(C),
+            "logistic_regression__class_weight": class_weight,
+        }
+        oof = _make_oof_probabilities(train, parameters, direction_parameters)
+        thresholds, audit = select_decision_policy(oof)
+        candidates.append((parameters, thresholds, audit))
+    if not candidates:
+        raise RuntimeError("Joint primary-model/policy search produced no result")
+
+    maximum_score = max(float(item[2]["macro_f1"]) for item in candidates)
+    eligible = [
+        item
+        for item in candidates
+        if float(item[2]["macro_f1"])
+        >= maximum_score - MODEL_SELECTION_SCORE_TOLERANCE
+    ]
+    best_parameters, best_thresholds, best_audit = max(
+        eligible,
+        key=lambda item: (
+            -float(item[0]["logistic_regression__C"]),
+            float(item[2]["macro_f1"]),
+            float(item[2]["cut_recall"]),
+            float(item[2]["balanced_accuracy"]),
+            float(item[2]["accuracy"]),
+        ),
+    )
+
+    selected = _fixed_pipeline(best_parameters)
+    selected.fit(train.loc[:, FEATURE_COLUMNS], train[PRIMARY_TARGET].astype(int))
+    primary_search.best_estimator_ = selected
+    primary_search.best_params_ = best_parameters
+    primary_search.best_score_ = float(best_audit["macro_f1"])
+    best_audit["primary_parameter_candidates_evaluated"] = int(
+        len(LOGISTIC_C_VALUES) * len(PRIMARY_CLASS_WEIGHT_OPTIONS)
+    )
+    best_audit["model_selection"] = (
+        "Choose the strongest regularization within the configured tolerance "
+        "of the best three-class OOF macro F1; then break ties by policy metrics"
+    )
+    best_audit["maximum_candidate_macro_f1"] = maximum_score
+    best_audit["score_tolerance"] = MODEL_SELECTION_SCORE_TOLERANCE
+    return primary_search, best_thresholds, best_audit
+
+
+def _evaluate(
+    y_true: pd.Series,
+    y_pred: pd.Series,
+    probabilities: np.ndarray,
+    labels: list[Any],
+) -> dict[str, Any]:
+    """Build a common metrics block from explicit policy predictions."""
+    truth = pd.Series(y_true).reset_index(drop=True)
+    predicted = pd.Series(y_pred).reset_index(drop=True)
+    probability_array = np.asarray(probabilities, dtype=float)
+    if len(truth) == 0 or len(truth) != len(predicted):
+        raise ValueError("Evaluation targets and predictions must be equally sized")
+    if probability_array.shape != (len(truth), len(labels)):
+        raise ValueError("Evaluation probability matrix has the wrong shape")
+    if not np.allclose(probability_array.sum(axis=1), 1.0, atol=1e-10):
+        raise ValueError("Evaluation probabilities do not sum to one")
+    majority = truth.value_counts().idxmax()
+    majority_prediction = pd.Series([majority] * len(truth))
+    metrics: dict[str, Any] = {
+        "sample_count": int(len(truth)),
+        "class_counts": {
+            str(label): int(truth.eq(label).sum()) for label in labels
+        },
+        "labels": _json_ready(labels),
+        "accuracy": float(accuracy_score(truth, predicted)),
+        "balanced_accuracy": float(balanced_accuracy_score(truth, predicted)),
         "majority_baseline": {
-            "class": _json_value(majority_class),
-            "accuracy": float(accuracy_score(y_test, majority_predictions)),
+            "class": _json_ready(majority),
+            "accuracy": float(accuracy_score(truth, majority_prediction)),
             "balanced_accuracy": float(
-                balanced_accuracy_score(y_test, majority_predictions)
+                balanced_accuracy_score(truth, majority_prediction)
             ),
         },
         "macro": {
             "precision": float(
                 precision_score(
-                    y_test, predictions, average="macro", zero_division=0
+                    truth, predicted, labels=labels, average="macro", zero_division=0
                 )
             ),
             "recall": float(
-                recall_score(y_test, predictions, average="macro", zero_division=0)
+                recall_score(
+                    truth, predicted, labels=labels, average="macro", zero_division=0
+                )
             ),
             "f1": float(
-                f1_score(y_test, predictions, average="macro", zero_division=0)
+                f1_score(
+                    truth, predicted, labels=labels, average="macro", zero_division=0
+                )
             ),
         },
         "weighted": {
             "precision": float(
                 precision_score(
-                    y_test, predictions, average="weighted", zero_division=0
+                    truth,
+                    predicted,
+                    labels=labels,
+                    average="weighted",
+                    zero_division=0,
                 )
             ),
             "recall": float(
                 recall_score(
-                    y_test, predictions, average="weighted", zero_division=0
+                    truth,
+                    predicted,
+                    labels=labels,
+                    average="weighted",
+                    zero_division=0,
                 )
             ),
             "f1": float(
-                f1_score(y_test, predictions, average="weighted", zero_division=0)
+                f1_score(
+                    truth,
+                    predicted,
+                    labels=labels,
+                    average="weighted",
+                    zero_division=0,
+                )
             ),
         },
         "confusion_matrix": {
-            "labels": labels,
-            "values": confusion_matrix(
-                y_test,
-                predictions,
-                labels=classifier.classes_,
-            ).astype(int).tolist(),
+            "labels": _json_ready(labels),
+            "values": confusion_matrix(truth, predicted, labels=labels).astype(int).tolist(),
         },
-    }
-
-    if hasattr(pipeline, "predict_proba"):
-        probabilities = pipeline.predict_proba(X_test)
-        probability_metrics: dict[str, Any] = {
+        "probability": {
             "log_loss": float(
-                log_loss(y_test, probabilities, labels=classifier.classes_)
-            )
-        }
-        if len(classifier.classes_) == 2 and y_test.nunique() == 2:
-            positive_class = classifier.classes_[1]
-            binary_truth = y_test.eq(positive_class).astype(int)
-            probability_metrics["roc_auc"] = float(
-                roc_auc_score(binary_truth, probabilities[:, 1])
-            )
-            probability_metrics["brier_score"] = float(
-                brier_score_loss(binary_truth, probabilities[:, 1])
-            )
-            probability_metrics["positive_class"] = _json_value(positive_class)
-        elif (
-            len(classifier.classes_) > 2
-            and set(y_test.tolist()) == set(classifier.classes_.tolist())
-        ):
-            probability_metrics["roc_auc_ovr_macro"] = float(
-                roc_auc_score(
-                    y_test,
-                    probabilities,
-                    labels=classifier.classes_,
-                    multi_class="ovr",
-                    average="macro",
+                -np.mean(
+                    np.log(
+                        np.clip(
+                            probability_array[
+                                np.arange(len(truth)),
+                                truth.map({label: index for index, label in enumerate(labels)}).to_numpy(),
+                            ],
+                            1e-15,
+                            1.0,
+                        )
+                    )
                 )
             )
-        metrics["probability"] = probability_metrics
+        },
+    }
+    if len(labels) == 2 and set(truth) == set(labels):
+        positive = labels[1]
+        binary_truth = truth.eq(positive).astype(int)
+        metrics["probability"].update(
+            {
+                "roc_auc": float(roc_auc_score(binary_truth, probability_array[:, 1])),
+                "brier_score": float(
+                    brier_score_loss(binary_truth, probability_array[:, 1])
+                ),
+                "positive_class": _json_ready(positive),
+            }
+        )
+    elif len(labels) > 2 and set(truth) == set(labels):
+        sorted_labels = sorted(labels)
+        sorted_probabilities = probability_array[
+            :, [labels.index(label) for label in sorted_labels]
+        ]
+        metrics["probability"]["roc_auc_ovr_macro"] = float(
+            roc_auc_score(
+                truth,
+                sorted_probabilities,
+                labels=sorted_labels,
+                multi_class="ovr",
+                average="macro",
+            )
+        )
     return metrics
 
 
-def extract_coefficients(
-    fitted_estimator: Any,
-    feature_names: tuple[str, ...],
+def _coefficients(
+    estimator: GridSearchCV,
     *,
     target_name: str,
-) -> "pd.DataFrame":
-    """Return tidy standardized coefficients for every class and feature.
-
-    Binary sklearn models store one positive-class vector; this function emits
-    that vector for the positive class and its sign-reversed equivalent for the
-    negative class. Coefficients describe standardized association, not causation
-    or standalone feature importance.
-    """
-    if not isinstance(feature_names, tuple) or not feature_names:
-        raise ValueError("feature_names must be a non-empty tuple")
-    if len(set(feature_names)) != len(feature_names):
-        raise ValueError("feature_names contains duplicates")
-    if target_name not in {PRIMARY_TARGET, DIAGNOSTIC_TARGET}:
-        raise ValueError(f"Unknown target_name: {target_name}")
-
-    pipeline = _unwrap_pipeline(fitted_estimator)
+) -> pd.DataFrame:
+    """Return standardized coefficients for both sides of a binary model."""
+    pipeline = estimator.best_estimator_
     classifier = pipeline.named_steps["logistic_regression"]
+    classes = list(classifier.classes_)
     coefficients = np.asarray(classifier.coef_, dtype=float)
     intercepts = np.asarray(classifier.intercept_, dtype=float)
-    classes = list(classifier.classes_)
-    if coefficients.shape[1] != len(feature_names):
-        raise ValueError(
-            "Coefficient width does not match the supplied feature names"
-        )
-
-    if len(classes) == 2 and coefficients.shape[0] == 1:
-        class_coefficients = np.vstack((-coefficients[0], coefficients[0]))
-        class_intercepts = np.array((-intercepts[0], intercepts[0]))
-    elif coefficients.shape[0] == len(classes):
-        class_coefficients = coefficients
-        class_intercepts = intercepts
-    else:
-        raise ValueError("Classifier classes and coefficient rows are inconsistent")
-
+    if len(classes) != 2 or coefficients.shape != (1, len(FEATURE_COLUMNS)):
+        raise ValueError("Hierarchical component must be a fitted binary model")
     rows: list[dict[str, Any]] = []
-    for class_position, class_label in enumerate(classes):
-        for feature_position, feature_name in enumerate(feature_names):
-            coefficient = float(
-                class_coefficients[class_position, feature_position]
-            )
+    for class_index, class_label in enumerate(classes):
+        sign = -1.0 if class_index == 0 else 1.0
+        for feature_index, feature in enumerate(FEATURE_COLUMNS):
+            coefficient = sign * float(coefficients[0, feature_index])
             rows.append(
                 {
                     "target": target_name,
                     "model": "standard_scaler_logistic_regression",
-                    "class": _json_value(class_label),
-                    "feature": feature_name,
+                    "class": _json_ready(class_label),
+                    "feature": feature,
                     "standardized_coefficient": coefficient,
                     "odds_ratio_per_1sd": float(np.exp(coefficient)),
-                    "intercept": float(class_intercepts[class_position]),
+                    "intercept": sign * float(intercepts[0]),
                     "regularization_C": float(classifier.C),
+                    "class_weight": json.dumps(_json_ready(classifier.class_weight)),
                 }
             )
-    return pd.DataFrame.from_records(rows)
+    return pd.DataFrame(rows)
 
 
-def train_target(
-    train: "pd.DataFrame",
-    test: "pd.DataFrame",
+def _model_summary(
+    search: GridSearchCV,
+    y_train: pd.Series,
     *,
     target_name: str,
-) -> tuple[Any, dict[str, Any], "pd.DataFrame"]:
-    """Train, tune, evaluate, and summarize one declared target.
-
-    Only configured features are exposed to the estimator. Target-specific
-    scoring names come from ``config.py``.
-    """
-    if not isinstance(train, pd.DataFrame) or not isinstance(test, pd.DataFrame):
-        raise TypeError("train and test must be pandas DataFrames")
-    if train.empty or test.empty:
-        raise ValueError("train and test must both contain observations")
-    if target_name not in {PRIMARY_TARGET, DIAGNOSTIC_TARGET}:
-        raise ValueError(f"Unknown target_name: {target_name}")
-
-    required_columns = set(FEATURE_COLUMNS) | {target_name, "meeting_date"}
-    for partition_name, partition in (("train", train), ("test", test)):
-        missing = sorted(required_columns - set(partition.columns))
-        if missing:
-            raise ValueError(f"{partition_name} is missing columns: {missing}")
-    if train["meeting_date"].max() >= test["meeting_date"].min():
-        raise ValueError("train must end strictly before test begins")
-
-    X_train = train.loc[:, FEATURE_COLUMNS]
-    X_test = test.loc[:, FEATURE_COLUMNS]
-    y_train = train[target_name]
-    y_test = test[target_name]
-    multiclass = target_name == DIAGNOSTIC_TARGET
-    scoring = (
-        DIAGNOSTIC_MODEL_SCORING if multiclass else PRIMARY_MODEL_SCORING
-    )
-
-    search = tune_estimator(
-        make_estimator(multiclass=multiclass),
-        X_train,
-        y_train,
-        scoring=scoring,
-    )
-    holdout_metrics = evaluate_classifier(search, X_test, y_test)
-    train_counts = y_train.value_counts()
-    metrics: dict[str, Any] = {
+    scoring: str,
+) -> dict[str, Any]:
+    """Describe a tuned model before holdout metrics are attached."""
+    return {
         "target": target_name,
         "scoring": scoring,
-        "train_sample_count": int(len(train)),
+        "train_sample_count": int(len(y_train)),
         "train_class_counts": {
-            str(_json_value(label)): int(count)
-            for label, count in train_counts.items()
+            str(label): int(count) for label, count in y_train.value_counts().items()
         },
         "cv_best_score": float(search.best_score_),
-        "best_parameters": {
-            key: _json_value(value) for key, value in search.best_params_.items()
-        },
+        "best_parameters": _json_ready(search.best_params_),
         "cv_splits": int(search.n_splits_),
-        "holdout": holdout_metrics,
     }
-    coefficients = extract_coefficients(
-        search,
-        FEATURE_COLUMNS,
-        target_name=target_name,
+
+
+def _build_prediction_table(
+    test: pd.DataFrame,
+    policy: pd.DataFrame,
+) -> pd.DataFrame:
+    """Add dates and actual decisions to the complete policy audit table."""
+    predictions = policy.copy()
+    predictions.insert(
+        0, "meeting_date", pd.to_datetime(test["meeting_date"]).reset_index(drop=True)
     )
-    return search, metrics, coefficients
-
-
-def build_holdout_prediction_table(
-    primary_estimator: Any,
-    diagnostic_estimator: Any,
-    test: "pd.DataFrame",
-) -> "pd.DataFrame":
-    """Return dated out-of-sample predictions for the chronological holdout."""
-    if not isinstance(test, pd.DataFrame) or test.empty:
-        raise ValueError("test must be a non-empty pandas DataFrame")
-    required_columns = {
-        "meeting_date",
-        *FEATURE_COLUMNS,
-        PRIMARY_TARGET,
-        DIAGNOSTIC_TARGET,
-    }
-    missing = sorted(required_columns - set(test.columns))
-    if missing:
-        raise ValueError(f"test is missing prediction-table columns: {missing}")
-
-    primary_pipeline = _unwrap_pipeline(primary_estimator)
-    diagnostic_pipeline = _unwrap_pipeline(diagnostic_estimator)
-    primary_classes = list(
-        primary_pipeline.named_steps["logistic_regression"].classes_
+    predictions.insert(1, "dataset_split", "chronological_holdout")
+    predictions.insert(
+        2, "actual_is_change", test[PRIMARY_TARGET].astype("int8").to_numpy()
     )
-    diagnostic_classes = list(
-        diagnostic_pipeline.named_steps["logistic_regression"].classes_
+    predictions.insert(
+        3,
+        "predicted_is_change",
+        predictions["final_decision"].ne("hold").astype("int8"),
     )
-    if set(primary_classes) != {0, 1}:
-        raise ValueError(f"Primary model classes must be 0 and 1: {primary_classes}")
-    if set(diagnostic_classes) != set(DECISION_CLASSES):
-        raise ValueError(
-            "Diagnostic model classes disagree with configured decisions: "
-            f"{diagnostic_classes}"
-        )
-
-    X_test = test.loc[:, FEATURE_COLUMNS]
-    primary_probabilities = primary_pipeline.predict_proba(X_test)
-    diagnostic_probabilities = diagnostic_pipeline.predict_proba(X_test)
-    if not np.allclose(primary_probabilities.sum(axis=1), 1.0, atol=1e-10):
-        raise RuntimeError("Primary prediction probabilities do not sum to one")
-    if not np.allclose(diagnostic_probabilities.sum(axis=1), 1.0, atol=1e-10):
-        raise RuntimeError("Diagnostic prediction probabilities do not sum to one")
-
-    primary_positions = {
-        _json_value(label): position for position, label in enumerate(primary_classes)
-    }
-    diagnostic_positions = {
-        str(_json_value(label)): position
-        for position, label in enumerate(diagnostic_classes)
-    }
-    predictions = pd.DataFrame(
-        {
-            "meeting_date": pd.to_datetime(test["meeting_date"], errors="coerce"),
-            "dataset_split": "chronological_holdout",
-            "actual_is_change": test[PRIMARY_TARGET].astype("int8").to_numpy(),
-            "predicted_is_change": primary_pipeline.predict(X_test).astype("int8"),
-            "probability_change": primary_probabilities[
-                :, primary_positions[1]
-            ],
-            "actual_decision": test[DIAGNOSTIC_TARGET].astype("string").to_numpy(),
-            "predicted_decision": diagnostic_pipeline.predict(X_test),
-            "probability_cut": diagnostic_probabilities[
-                :, diagnostic_positions["cut"]
-            ],
-            "probability_hold": diagnostic_probabilities[
-                :, diagnostic_positions["hold"]
-            ],
-            "probability_hike": diagnostic_probabilities[
-                :, diagnostic_positions["hike"]
-            ],
-        }
+    predictions.insert(
+        6,
+        "actual_decision",
+        test[DIAGNOSTIC_TARGET].astype(str).to_numpy(),
     )
-    if predictions["meeting_date"].isna().any():
-        raise ValueError("test contains missing or invalid meeting dates")
-    if predictions["meeting_date"].duplicated().any():
-        raise ValueError("test contains duplicate meeting dates")
-    if not predictions["actual_decision"].isin(DECISION_CLASSES).all():
-        raise ValueError("Prediction table contains invalid actual decisions")
-    if not predictions["predicted_decision"].isin(DECISION_CLASSES).all():
-        raise ValueError("Prediction table contains invalid predicted decisions")
-    if not predictions["actual_is_change"].isin([0, 1]).all():
-        raise ValueError("Prediction table contains invalid actual binary targets")
-    if not predictions["predicted_is_change"].isin([0, 1]).all():
-        raise ValueError("Prediction table contains invalid binary predictions")
+    predictions.insert(7, "predicted_decision", predictions["final_decision"])
+    if predictions["meeting_date"].isna().any() or predictions["meeting_date"].duplicated().any():
+        raise ValueError("Prediction dates are missing or duplicated")
+    probability_columns = ["probability_cut", "probability_hold", "probability_hike"]
+    if not np.allclose(predictions[probability_columns].sum(axis=1), 1.0):
+        raise RuntimeError("Joint decision probabilities do not sum to one")
     return predictions.sort_values("meeting_date").reset_index(drop=True)
 
 
-def train_models() -> tuple[Path, Path, Path]:
-    """Train both targets and write metrics, coefficients, and predictions.
-
-    All paths and the holdout fraction come from ``config.py``. Estimators are
-    deliberately not serialized; the JSON and CSV artifacts are safe to inspect
-    and the full training run is inexpensive and reproducible.
-    """
-    panel = load_feature_panel()
-    train, test = chronological_train_test_split(panel)
-
-    primary_estimator, primary_metrics, primary_coefficients = train_target(
-        train,
-        test,
-        target_name=PRIMARY_TARGET,
-    )
-    diagnostic_estimator, diagnostic_metrics, diagnostic_coefficients = train_target(
-        train,
-        test,
-        target_name=DIAGNOSTIC_TARGET,
-    )
-
-    metrics: dict[str, Any] = {
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "dataset": {
-            "feature_path": str(FEATURE_PANEL_PATH),
-            "row_count": int(len(panel)),
-            "feature_count": int(len(FEATURE_COLUMNS)),
-            "first_meeting": panel["meeting_date"].iloc[0].strftime("%Y-%m-%d"),
-            "last_meeting": panel["meeting_date"].iloc[-1].strftime("%Y-%m-%d"),
-            "test_fraction": MODEL_TEST_FRACTION,
-            "train": {
-                "row_count": int(len(train)),
-                "first_meeting": train["meeting_date"].iloc[0].strftime("%Y-%m-%d"),
-                "last_meeting": train["meeting_date"].iloc[-1].strftime("%Y-%m-%d"),
-            },
-            "test": {
-                "row_count": int(len(test)),
-                "first_meeting": test["meeting_date"].iloc[0].strftime("%Y-%m-%d"),
-                "last_meeting": test["meeting_date"].iloc[-1].strftime("%Y-%m-%d"),
-            },
-        },
-        "methodology": {
-            "holdout": "newest meetings; no shuffling",
-            "cross_validation": (
-                f"{CV_SPLITS}-split TimeSeriesSplit with class-complete "
-                "training prefixes"
-            ),
-            "preprocessing": "StandardScaler fitted inside each CV pipeline fold",
-            "coefficient_interpretation": (
-                "standardized association; not causation or standalone importance"
-            ),
-            "vintage_limit": (
-                "macro reference periods are aligned before meetings, but the "
-                "panel is not based on unrevised point-in-time release vintages"
-            ),
-        },
-        "models": {
-            PRIMARY_TARGET: primary_metrics,
-            DIAGNOSTIC_TARGET: diagnostic_metrics,
-        },
-    }
-    coefficients = pd.concat(
-        [primary_coefficients, diagnostic_coefficients],
-        ignore_index=True,
-    )
-    predictions = build_holdout_prediction_table(
-        primary_estimator,
-        diagnostic_estimator,
-        test,
-    )
-
-    MODEL_METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    metrics_temporary_path: Path | None = None
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write a JSON artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             newline="\n",
-            prefix=f".{MODEL_METRICS_PATH.name}.",
+            prefix=f".{path.name}.",
             suffix=".tmp",
-            dir=MODEL_METRICS_PATH.parent,
+            dir=path.parent,
             delete=False,
-        ) as temporary_file:
-            metrics_temporary_path = Path(temporary_file.name)
-            json.dump(metrics, temporary_file, indent=2, allow_nan=False)
-            temporary_file.write("\n")
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        metrics_temporary_path.replace(MODEL_METRICS_PATH)
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(_json_ready(payload), temporary, indent=2, allow_nan=False)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.replace(path)
     except Exception:
-        if metrics_temporary_path is not None:
-            metrics_temporary_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
         raise
 
-    coefficients_temporary_path: Path | None = None
+
+def _atomic_csv(path: Path, frame: pd.DataFrame) -> None:
+    """Atomically write a CSV artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             newline="",
-            prefix=f".{MODEL_COEFFICIENTS_PATH.name}.",
+            prefix=f".{path.name}.",
             suffix=".tmp",
-            dir=MODEL_COEFFICIENTS_PATH.parent,
+            dir=path.parent,
             delete=False,
-        ) as temporary_file:
-            coefficients_temporary_path = Path(temporary_file.name)
-            coefficients.to_csv(temporary_file, index=False)
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        coefficients_temporary_path.replace(MODEL_COEFFICIENTS_PATH)
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            frame.to_csv(temporary, index=False, date_format="%Y-%m-%d")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.replace(path)
     except Exception:
-        if coefficients_temporary_path is not None:
-            coefficients_temporary_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
         raise
 
-    predictions_temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="",
-            prefix=f".{MODEL_PREDICTIONS_PATH.name}.",
-            suffix=".tmp",
-            dir=MODEL_PREDICTIONS_PATH.parent,
-            delete=False,
-        ) as temporary_file:
-            predictions_temporary_path = Path(temporary_file.name)
-            predictions.to_csv(
-                temporary_file,
-                index=False,
-                date_format="%Y-%m-%d",
-            )
-            temporary_file.flush()
-            os.fsync(temporary_file.fileno())
-        predictions_temporary_path.replace(MODEL_PREDICTIONS_PATH)
-    except Exception:
-        if predictions_temporary_path is not None:
-            predictions_temporary_path.unlink(missing_ok=True)
-        raise
+
+def train_models() -> tuple[Path, Path, Path]:
+    """Train the hierarchy and write metrics, coefficients, and prediction audit."""
+    panel = load_feature_panel()
+    train, test = chronological_train_test_split(panel)
+    X_train = train.loc[:, FEATURE_COLUMNS]
+    X_test = test.loc[:, FEATURE_COLUMNS]
+
+    primary_y = train[PRIMARY_TARGET].astype(int)
+    primary = _tune_model(
+        X_train,
+        primary_y,
+        class_weights=PRIMARY_CLASS_WEIGHT_OPTIONS,
+        scoring=PRIMARY_MODEL_SCORING,
+    )
+
+    direction_train = train.loc[train[PRIMARY_TARGET].eq(1)].copy()
+    direction_y = direction_train[DIAGNOSTIC_TARGET].astype(str)
+    if set(direction_y) != {"cut", "hike"}:
+        raise ValueError("Direction training rows must contain both cut and hike")
+    direction_weights = [
+        {"cut": float(weight), "hike": 1.0}
+        for weight in DIRECTION_CUT_WEIGHT_OPTIONS
+    ]
+    direction = _tune_model(
+        direction_train.loc[:, FEATURE_COLUMNS],
+        direction_y,
+        class_weights=direction_weights,
+        scoring=DIAGNOSTIC_MODEL_SCORING,
+    )
+
+    primary, thresholds, policy_cv = _select_primary_model_and_policy(
+        train,
+        primary,
+        direction.best_params_,
+    )
+
+    p_change = _positive_probability(primary, X_test, 1)
+    p_cut_direction = _positive_probability(direction, X_test, "cut")
+    holdout_policy = apply_decision_policy(p_change, p_cut_direction, thresholds)
+    predictions = _build_prediction_table(test, holdout_policy)
+
+    binary_probabilities = np.column_stack((1.0 - p_change, p_change))
+    final_binary = predictions["predicted_is_change"].astype(int)
+    raw_binary = predictions["raw_predicted_is_change"].astype(int)
+    primary_metrics = _model_summary(
+        primary,
+        primary_y,
+        target_name=PRIMARY_TARGET,
+        scoring=DECISION_POLICY_SCORING,
+    )
+    primary_metrics["selection_note"] = (
+        "C and class weight were selected jointly with the downstream policy "
+        "on chronological training OOF predictions"
+    )
+    primary_metrics["holdout"] = _evaluate(
+        test[PRIMARY_TARGET].astype(int),
+        final_binary,
+        binary_probabilities,
+        [0, 1],
+    )
+    primary_metrics["raw_model_holdout"] = _evaluate(
+        test[PRIMARY_TARGET].astype(int),
+        raw_binary,
+        binary_probabilities,
+        [0, 1],
+    )
+
+    change_mask = test[PRIMARY_TARGET].eq(1).to_numpy()
+    conditional_truth = test.loc[test[PRIMARY_TARGET].eq(1), DIAGNOSTIC_TARGET].astype(str)
+    conditional_cut_probability = p_cut_direction[change_mask]
+    conditional_prediction = np.where(
+        conditional_cut_probability >= thresholds["direction_cut_threshold"],
+        "cut",
+        "hike",
+    )
+    conditional_probabilities = np.column_stack(
+        (conditional_cut_probability, 1.0 - conditional_cut_probability)
+    )
+    direction_metrics = _model_summary(
+        direction,
+        direction_y,
+        target_name=DIRECTION_TARGET,
+        scoring=DIAGNOSTIC_MODEL_SCORING,
+    )
+    direction_metrics["definition"] = "cut versus hike, conditional on an actual change"
+    direction_metrics["holdout"] = _evaluate(
+        conditional_truth,
+        pd.Series(conditional_prediction),
+        conditional_probabilities,
+        ["cut", "hike"],
+    )
+
+    joint_probabilities = predictions[
+        ["probability_cut", "probability_hold", "probability_hike"]
+    ].to_numpy()
+    actual_decision = test[DIAGNOSTIC_TARGET].astype(str)
+    decision_metrics = {
+        "target": DIAGNOSTIC_TARGET,
+        "architecture": "P(change) multiplied by P(cut or hike | change)",
+        "thresholds": thresholds,
+        "policy_cross_validation": policy_cv,
+        "holdout": _evaluate(
+            actual_decision,
+            predictions["final_decision"].astype(str),
+            joint_probabilities,
+            list(DECISION_CLASSES),
+        ),
+        "raw_model_holdout": _evaluate(
+            actual_decision,
+            predictions["raw_model_decision"].astype(str),
+            joint_probabilities,
+            list(DECISION_CLASSES),
+        ),
+        "override_audit": {
+            "obvious_cut_signal_count": int(
+                predictions["obvious_cut_signal"].sum()
+            ),
+            "override_count": int(predictions["cut_override_triggered"].sum()),
+            "correct_override_count": int(
+                (
+                    predictions["cut_override_triggered"]
+                    & predictions["actual_decision"].eq("cut")
+                ).sum()
+            ),
+            "incorrect_override_count": int(
+                (
+                    predictions["cut_override_triggered"]
+                    & predictions["actual_decision"].ne("cut")
+                ).sum()
+            ),
+        },
+    }
+
+    metrics = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "dataset": {
+            "feature_path": str(FEATURE_PANEL_PATH),
+            "row_count": int(len(panel)),
+            "feature_count": int(len(FEATURE_COLUMNS)),
+            "first_meeting": panel.meeting_date.iloc[0].strftime("%Y-%m-%d"),
+            "last_meeting": panel.meeting_date.iloc[-1].strftime("%Y-%m-%d"),
+            "test_fraction": MODEL_TEST_FRACTION,
+            "train": {
+                "row_count": int(len(train)),
+                "first_meeting": train.meeting_date.iloc[0].strftime("%Y-%m-%d"),
+                "last_meeting": train.meeting_date.iloc[-1].strftime("%Y-%m-%d"),
+            },
+            "test": {
+                "row_count": int(len(test)),
+                "first_meeting": test.meeting_date.iloc[0].strftime("%Y-%m-%d"),
+                "last_meeting": test.meeting_date.iloc[-1].strftime("%Y-%m-%d"),
+            },
+        },
+        "methodology": {
+            "holdout": "newest meetings; no shuffling; never used to select thresholds",
+            "architecture": "hierarchical change model then cut-versus-hike model",
+            "cross_validation": f"{CV_SPLITS}-split forward TimeSeriesSplit",
+            "preprocessing": "StandardScaler fitted inside each model fit",
+            "override": "three probability gates selected on training OOF predictions",
+            "vintage_limit": (
+                "macro dates precede meetings, but inputs are not unrevised "
+                "point-in-time release vintages"
+            ),
+        },
+        "models": {
+            PRIMARY_TARGET: primary_metrics,
+            DIRECTION_TARGET: direction_metrics,
+            DIAGNOSTIC_TARGET: decision_metrics,
+        },
+    }
+    coefficients = pd.concat(
+        [
+            _coefficients(primary, target_name=PRIMARY_TARGET),
+            _coefficients(direction, target_name=DIRECTION_TARGET),
+        ],
+        ignore_index=True,
+    )
+    _atomic_json(MODEL_METRICS_PATH, metrics)
+    _atomic_csv(MODEL_COEFFICIENTS_PATH, coefficients)
+    _atomic_csv(MODEL_PREDICTIONS_PATH, predictions)
     return MODEL_METRICS_PATH, MODEL_COEFFICIENTS_PATH, MODEL_PREDICTIONS_PATH
 
 
 def main() -> None:
-    """Train both configured targets and report the primary holdout result."""
+    """Run model training using only configured project paths."""
     metrics_path, coefficients_path, predictions_path = train_models()
     with metrics_path.open(encoding="utf-8") as metrics_file:
         metrics = json.load(metrics_file)
-    primary_holdout = metrics["models"][PRIMARY_TARGET]["holdout"]
-
+    binary = metrics["models"][PRIMARY_TARGET]["holdout"]
+    decision = metrics["models"][DIAGNOSTIC_TARGET]["holdout"]
+    override = metrics["models"][DIAGNOSTIC_TARGET]["override_audit"]
     print(f"Saved metrics to {metrics_path}")
     print(f"Saved coefficients to {coefficients_path}")
     print(f"Saved holdout predictions to {predictions_path}")
     print(
-        "Primary holdout: "
-        f"accuracy={primary_holdout['accuracy']:.3f}, "
-        f"balanced_accuracy={primary_holdout['balanced_accuracy']:.3f}, "
-        f"macro_f1={primary_holdout['macro']['f1']:.3f}, "
-        f"roc_auc={primary_holdout['probability']['roc_auc']:.3f}"
+        "Holdout change model: "
+        f"accuracy={binary['accuracy']:.3f}, "
+        f"balanced_accuracy={binary['balanced_accuracy']:.3f}, "
+        f"macro_f1={binary['macro']['f1']:.3f}"
     )
     print(
-        "Majority baseline: "
-        f"accuracy={primary_holdout['majority_baseline']['accuracy']:.3f}, "
-        "balanced_accuracy="
-        f"{primary_holdout['majority_baseline']['balanced_accuracy']:.3f}"
+        "Holdout decision policy: "
+        f"accuracy={decision['accuracy']:.3f}, "
+        f"balanced_accuracy={decision['balanced_accuracy']:.3f}, "
+        f"macro_f1={decision['macro']['f1']:.3f}, "
+        f"overrides={override['override_count']}"
     )
 
 

@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import nbformat
 import numpy as np
@@ -26,6 +31,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from config import (
+    FEATURE_COLUMNS,
     FEATURE_PANEL_PATH,
     MODEL_METRICS_PATH,
     MODEL_PREDICTIONS_PATH,
@@ -39,6 +45,18 @@ PREDICTIONS_PATH = MODEL_PREDICTIONS_PATH
 NOTEBOOK_PATH = OUTPUTS / "model_accuracy_diagnostics.ipynb"
 ARTIFACT_PATH = OUTPUTS / "model_accuracy_artifact.json"
 REPORT_PATH = OUTPUTS / "model_accuracy_report.html"
+REPORT_RENDERER_ENV = "DATA_ANALYTICS_REPORT_RENDERER"
+REPORT_RENDERER_RELATIVE_PATH = Path(
+    "skills/build-report/scripts/deliver_portable_artifact.mjs"
+)
+REPORT_RENDERER_CACHE_ROOT = (
+    Path.home()
+    / ".codex"
+    / "plugins"
+    / "cache"
+    / "openai-curated-remote"
+    / "data-analytics"
+)
 
 
 def load_and_validate() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
@@ -127,43 +145,8 @@ def run_exploratory_experiment(
     features: pd.DataFrame,
     predictions: pd.DataFrame,
 ) -> dict[str, object]:
-    """Evaluate the documented lagged-history hypothesis on the current holdout."""
+    """Refit the configured feature set as a secondary binary diagnostic."""
     experiment = features.copy()
-    signed = experiment["decision"].map({"cut": -1, "hold": 0, "hike": 1})
-    experiment["prior_decision"] = signed.shift(1).fillna(0)
-    experiment["prior_is_change"] = experiment["is_change"].shift(1).fillna(0)
-    experiment["prior2_is_change"] = experiment["is_change"].shift(2).fillna(0)
-    experiment["prior3_change_count"] = (
-        experiment["is_change"].shift(1).rolling(3, min_periods=1).sum().fillna(0)
-    )
-    experiment["prior3_direction"] = (
-        signed.shift(1).rolling(3, min_periods=1).sum().fillna(0)
-    )
-    meeting_gap = experiment["meeting_date"].diff().dt.days
-    experiment["days_since_prior_meeting"] = meeting_gap.fillna(meeting_gap.median())
-    last_change = (
-        experiment["meeting_date"]
-        .where(experiment["is_change"].eq(1))
-        .shift(1)
-        .ffill()
-    )
-    experiment["days_since_prior_change"] = (
-        (experiment["meeting_date"] - last_change)
-        .dt.days.fillna(3650)
-        .clip(upper=3650)
-    )
-
-    macro = [
-        "rate_level", "rate_chg_1m", "rate_chg_3m", "pce_yoy",
-        "pce_yoy_chg", "pce_yoy_chg3", "pce_yoy_ma3", "pce_yoy_ma6",
-        "unemployment", "unemp_chg", "unemp_chg3", "natural_unemployment",
-        "real_rate_proxy", "labour_gap", "abs_inflation_gap",
-    ]
-    history = [
-        "prior_decision", "prior_is_change", "prior2_is_change",
-        "prior3_change_count", "prior3_direction", "days_since_prior_meeting",
-        "days_since_prior_change",
-    ]
     split_index = len(experiment) - len(predictions)
     train = experiment.iloc[:split_index]
     test = experiment.iloc[split_index:]
@@ -201,7 +184,7 @@ def run_exploratory_experiment(
         cv=TimeSeriesSplit(n_splits=5, test_size=cv_test_size),
         error_score="raise",
     )
-    columns = macro + history
+    columns = list(FEATURE_COLUMNS)
     search.fit(train[columns], train["is_change"])
     predicted = search.predict(test[columns])
     probability = search.predict_proba(test[columns])[:, 1]
@@ -217,10 +200,10 @@ def run_exploratory_experiment(
 
 
 def build_notebook() -> None:
-    """Create and execute the reproducible diagnostic notebook."""
+    """Create and execute the reproducible diagnostic notebook without errors."""
     notebook = nbformat.v4.new_notebook()
     notebook.metadata["kernelspec"] = {
-        "display_name": "Python 3",
+        "display_name": "Python 3 (project environment)",
         "language": "python",
         "name": "python3",
     }
@@ -325,7 +308,7 @@ def build_notebook() -> None:
             ".dt.days.fillna(3650).clip(upper=3650))\n"
             "macro = ['rate_level','rate_chg_1m','rate_chg_3m','pce_yoy','pce_yoy_chg',"
             "'pce_yoy_chg3','pce_yoy_ma3','pce_yoy_ma6','unemployment','unemp_chg',"
-            "'unemp_chg3','natural_unemployment','real_rate_proxy','labour_gap',"
+            "'unemp_chg3','natural_unemployment','unemp_ma3','is_scheduled',"
             "'abs_inflation_gap']\n"
             "history = ['prior_decision','prior_is_change','prior2_is_change',"
             "'prior3_change_count','prior3_direction','days_since_prior_meeting',"
@@ -361,19 +344,38 @@ def build_notebook() -> None:
             "- **Model versus baseline:** grouped bar; accuracy and balanced accuracy; "
             "supports the limited incremental-gain finding.\n"
             "- **Decision-class recall:** single-series bar; cut/hold/hike; supports the "
-            "zero-cut-recall finding.\n"
+            "decision-class recall finding.\n"
             "- **QA:** saved metrics were independently recomputed; prediction dates "
             "match the newest feature-panel meetings; all probability scores are "
             "finite and within [0, 1]."
         ),
     ]
+    execution_environment = os.environ.copy()
+    interpreter_directory = str(Path(sys.executable).resolve().parent)
+    execution_environment["PATH"] = (
+        interpreter_directory
+        + os.pathsep
+        + execution_environment.get("PATH", "")
+    )
     client = NotebookClient(
         notebook,
         timeout=120,
         kernel_name="python3",
         resources={"metadata": {"path": str(REPOSITORY_DIR)}},
+        allow_errors=False,
+        force_raise_errors=True,
     )
-    executed = client.execute()
+    executed = client.execute(env=execution_environment)
+    for cell_index, cell in enumerate(executed.cells):
+        if cell.cell_type != "code":
+            continue
+        if cell.execution_count is None:
+            raise RuntimeError(f"Notebook code cell {cell_index} did not execute")
+        if any(
+            output.get("output_type") == "error"
+            for output in cell.get("outputs", [])
+        ):
+            raise RuntimeError(f"Notebook code cell {cell_index} saved an error")
     nbformat.write(executed, NOTEBOOK_PATH)
 
 
@@ -388,6 +390,7 @@ def build_artifact(
     decision = metrics["models"]["decision"]["holdout"]
     generated_at = metrics["generated_at_utc"]
     sample_count = int(binary["sample_count"])
+    feature_count = int(metrics["dataset"]["feature_count"])
     actual = predictions["actual_is_change"].astype(int)
     predicted = predictions["predicted_is_change"].astype(int)
     model_correct = int(actual.eq(predicted).sum())
@@ -728,8 +731,8 @@ def build_artifact(
                         f"Balanced accuracy is **{binary['balanced_accuracy']:.1%}**, but a stratified bootstrap places its "
                         "approximate 95% interval at "
                         f"**{intervals['balanced_accuracy'][0]:.1%}–{intervals['balanced_accuracy'][2]:.1%}**. "
-                        "The immediate objective should be better time-valid information and evaluation, with market expectations and "
-                        "meeting-cycle state added before trying a more complex model."
+                        "The meeting-cycle state is now included. The immediate objective should be point-in-time macro vintages, "
+                        "market expectations, and stricter walk-forward evaluation before trying a more complex model."
                     ),
                 },
                 {
@@ -783,13 +786,13 @@ def build_artifact(
                     "sourceId": "diagnostic_notebook",
                     "body": (
                         "## Add cycle state and remove redundant representations\n\n"
-                        "Add only lagged meeting features: previous action and size, consecutive actions in the same direction, meetings and "
-                        "days since the last change, days since the prior meeting, and whether the meeting is scheduled. An exploratory "
-                        f"variant combining these fields with a de-duplicated macro set reached **{exploratory['accuracy']:.1%} "
+                        "The production panel now uses only strictly lagged meeting features: previous action and size, consecutive actions "
+                        "in the same direction, days since the last change, days since the prior meeting, and whether the meeting is "
+                        "scheduled. A secondary refit of that configured feature set reached **"
+                        f"{exploratory['accuracy']:.1%} "
                         f"accuracy**, **{exploratory['balanced_accuracy']:.1%} balanced accuracy**, and a "
-                        f"**{exploratory['brier_score']:.3f} Brier score** on this same holdout. This is a hypothesis, not a "
-                        "validated gain, because "
-                        "the variant was proposed after the holdout errors were inspected."
+                        f"**{exploratory['brier_score']:.3f} Brier score** on this same holdout. This diagnostic is not an "
+                        "independent validation because it reuses the existing holdout."
                     ),
                 },
                 {
@@ -797,8 +800,8 @@ def build_artifact(
                     "type": "markdown",
                     "body": (
                         "## Keep the model small, coherent, and calibrated\n\n"
-                        "Use one coherent three-class probability model, then derive hold/change by summing hike and cut probabilities. "
-                        "This prevents the current binary and three-class predictions from disagreeing. Compare elastic-net logistic "
+                        "The production model now estimates P(change), then P(cut | change), and derives all three joint probabilities "
+                        "from those two components. This keeps binary and three-class predictions coherent. Compare elastic-net logistic "
                         "regression with one shallow tree-based benchmark, but tune class weights, regularization, thresholds, and "
                         "calibration only inside nested expanding-window folds. Optimize balanced accuracy and macro F1 alongside Brier "
                         "score and log loss; raw accuracy alone rewards predicting hold."
@@ -828,9 +831,9 @@ def build_artifact(
                         f"Wilson interval is roughly {wilson_low:.1%}–{wilson_high:.1%}, and the bootstrap interval for accuracy "
                         f"improvement over the majority baseline is {intervals['accuracy_gain_vs_hold'][0]:.1%}–"
                         f"{intervals['accuracy_gain_vs_hold'][2]:.1%}. Current FRED observations are revised "
-                        "rather than point-in-time vintages. The 19 features also contain exact or near-exact representations of the same "
-                        "signals—for example PCE inflation and its two-percent gap—which weakens coefficient interpretation and can amplify "
-                        "regime-specific confidence."
+                        f"rather than point-in-time vintages. The {feature_count} configured features remove the previous exact linear "
+                        "composites, but rolling macro measures and lagged policy-state variables remain correlated. Coefficients should "
+                        "therefore be interpreted as conditional associations, not causal effects."
                     ),
                 },
                 {
@@ -838,8 +841,8 @@ def build_artifact(
                     "type": "markdown",
                     "body": (
                         "## Recommended next step\n\n"
-                        "Implement the validation harness first, then add meeting-cycle features as the first controlled experiment. After "
-                        "that, add ALFRED vintages and a market-implied expectation feature. Do not choose a new threshold or model from the "
+                        "Implement the nested validation harness first, then add ALFRED vintages and a market-implied expectation feature "
+                        "as controlled experiments. Do not choose a new threshold or model from the "
                         f"current {sample_count} meetings; reserve a genuinely untouched period or use nested outer folds for the "
                         "acceptance decision.\n\n"
                         "### Further questions\n\n"
@@ -868,15 +871,104 @@ def build_artifact(
         artifact_file.write("\n")
 
 
+def resolve_report_renderer() -> Path:
+    """Locate the installed canonical portable-report delivery script.
+
+    ``DATA_ANALYTICS_REPORT_RENDERER`` may name either the delivery script or
+    the Data Analytics plugin root. Otherwise, use the newest cached plugin
+    package. The renderer is read and executed but is never modified.
+    """
+    configured = os.environ.get(REPORT_RENDERER_ENV)
+    if configured:
+        configured_path = Path(configured).expanduser().resolve()
+        candidate = (
+            configured_path / REPORT_RENDERER_RELATIVE_PATH
+            if configured_path.is_dir()
+            else configured_path
+        )
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"{REPORT_RENDERER_ENV} does not resolve to a renderer: {candidate}"
+            )
+        return candidate
+
+    candidates = list(
+        REPORT_RENDERER_CACHE_ROOT.glob(
+            f"*/{REPORT_RENDERER_RELATIVE_PATH.as_posix()}"
+        )
+    )
+    candidates = [candidate for candidate in candidates if candidate.is_file()]
+    if not candidates:
+        raise FileNotFoundError(
+            "Could not find the Data Analytics portable-report renderer. "
+            f"Set {REPORT_RENDERER_ENV} to the plugin root or delivery script."
+        )
+    return max(candidates, key=lambda candidate: candidate.parent.stat().st_mtime_ns)
+
+
+def render_html_report() -> dict[str, object]:
+    """Validate the JSON artifact and atomically regenerate the HTML report."""
+    if not ARTIFACT_PATH.is_file():
+        raise FileNotFoundError(f"Report artifact does not exist: {ARTIFACT_PATH}")
+    node_executable = shutil.which("node")
+    if node_executable is None:
+        raise FileNotFoundError(
+            "Node.js is required to render the portable HTML report"
+        )
+    renderer_path = resolve_report_renderer()
+    plugin_root = renderer_path.parents[3]
+    completed = subprocess.run(
+        [
+            node_executable,
+            str(renderer_path),
+            "--input",
+            str(ARTIFACT_PATH),
+            "--output",
+            str(REPORT_PATH),
+        ],
+        cwd=plugin_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        details = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"Portable HTML rendering failed: {details}")
+    output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not output_lines:
+        raise RuntimeError("Portable HTML renderer returned no verification receipt")
+    try:
+        receipt = json.loads(output_lines[-1])
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Portable HTML renderer returned an invalid verification receipt"
+        ) from error
+    if receipt.get("ok") is not True or not REPORT_PATH.is_file():
+        raise RuntimeError(f"Portable HTML renderer did not create {REPORT_PATH}")
+    verification = receipt.get("stages", {}).get("verification")
+    if verification not in {"passed", "structural_only"}:
+        raise RuntimeError(
+            f"Portable HTML verification did not pass: {verification!r}"
+        )
+    return receipt
+
+
 def main() -> None:
     metrics, predictions, features = load_and_validate()
     intervals = bootstrap_intervals(predictions, features)
     exploratory = run_exploratory_experiment(features, predictions)
     build_notebook()
     build_artifact(metrics, predictions, intervals, exploratory)
+    receipt = render_html_report()
     print(f"Saved executed notebook to {NOTEBOOK_PATH}")
     print(f"Saved report artifact to {ARTIFACT_PATH}")
-    print(f"Portable report target: {REPORT_PATH}")
+    print(f"Saved portable HTML report to {REPORT_PATH}")
+    print(
+        "HTML verification: "
+        f"{receipt['stages']['verification']} "
+        f"({receipt['counts']['charts']} charts, "
+        f"{receipt['counts']['tables']} tables)"
+    )
 
 
 if __name__ == "__main__":

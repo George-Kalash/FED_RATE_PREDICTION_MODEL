@@ -73,7 +73,7 @@ REQUEST_TIMEOUT_SECONDS: Final = 25
 
 # End-to-end pipeline behavior. Coverage scraping remains optional because it
 # does not feed the model and can be slow or blocked by third-party websites.
-PIPELINE_START_YEAR: Final = 1999
+PIPELINE_START_YEAR: Final = 1998
 PIPELINE_END_YEAR: Final = date.today().year
 PIPELINE_FRED_OBSERVATION_START: Final[str | None] = None
 PIPELINE_SCRAPE_COVERAGE: Final = False
@@ -160,6 +160,7 @@ CUT_OVERRIDE_MIN_CHANGE_VALUES: Final[tuple[float, ...]] = (0.25, 0.35, 0.45)
 CUT_OVERRIDE_DIRECTION_VALUES: Final[tuple[float, ...]] = (0.75, 0.85, 0.9)
 CUT_OVERRIDE_JOINT_VALUES: Final[tuple[float, ...]] = (0.2, 0.25, 0.3)
 DECISION_POLICY_SCORING: Final = "f1_macro"
+MODEL_SELECTION_SCORE_TOLERANCE: Final = 0.02
 
 FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "rate_level",
