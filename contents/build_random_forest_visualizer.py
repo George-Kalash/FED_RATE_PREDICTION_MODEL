@@ -85,8 +85,6 @@ def load_random_forest_visualizer_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     if predictions.empty:
         raise ValueError("Random-forest prediction table contains no rows")
 
-    # Select only random-forest fields. Decision-tree columns may exist in the
-    # shared artifact, but they never enter this notebook.
     prediction_data = predictions.loc[:, prediction_columns].rename(
         columns={
             "random_forest_prediction": "predicted_decision",
@@ -203,8 +201,7 @@ def create_notebook(
             "The notebook uses only the `random_forest_*` fields in "
             "`outputs/tree_model_predictions.csv`, merges meeting values from "
             "`data/clean/clean_panel.csv`, and reads random-forest importance from "
-            "`outputs/tree_model_feature_importance.csv`. Decision-tree results "
-            "are intentionally excluded.\n\n"
+            "`outputs/tree_model_feature_importance.csv`.\n\n"
             "### Key Assumptions\n\n"
             "- The policy-rate line is the observed target midpoint after each meeting.\n"
             "- Unemployment is the aligned value stored in the clean meeting panel.\n"

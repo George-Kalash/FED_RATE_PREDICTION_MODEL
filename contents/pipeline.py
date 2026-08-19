@@ -21,9 +21,6 @@ from config import (
     DATA_RAW,
     FEATURE_PANEL_PATH,
     FOMC_CALENDAR_URL,
-    MODEL_COEFFICIENTS_PATH,
-    MODEL_METRICS_PATH,
-    MODEL_PREDICTIONS_PATH,
     OUTPUTS,
     PIPELINE_END_YEAR,
     PIPELINE_FRED_OBSERVATION_START,
@@ -31,9 +28,12 @@ from config import (
     PIPELINE_START_YEAR,
     SOURCE_SCRAPE_JSONL_PATH,
     SOURCE_SCRAPE_SUMMARY_PATH,
+    TREE_MODEL_FACTOR_RANKINGS_PATH,
+    TREE_MODEL_IMPORTANCE_PATH,
+    TREE_MODEL_METRICS_PATH,
+    TREE_MODEL_PREDICTIONS_PATH,
 )
 from features import build_feature_panel
-from model import train_models
 from pull_from_apis import (
     fetch_fomc_meeting_calendar,
     pull_all_model_series,
@@ -41,6 +41,7 @@ from pull_from_apis import (
     save_fomc_meeting_calendar,
 )
 from scrape import scrape_all_sources, write_jsonl, write_summary_csv
+from tree_model import train_random_forest
 
 
 @dataclass(frozen=True)
@@ -126,16 +127,23 @@ def run_pipeline() -> None:
         f"{len(feature_frame.columns) - 3} features to {feature_path}"
     )
 
-    metrics_path, coefficients_path, predictions_path = train_models()
+    (
+        metrics_path,
+        predictions_path,
+        importance_path,
+        rankings_path,
+    ) = train_random_forest()
     if (
-        metrics_path != MODEL_METRICS_PATH
-        or coefficients_path != MODEL_COEFFICIENTS_PATH
-        or predictions_path != MODEL_PREDICTIONS_PATH
+        metrics_path != TREE_MODEL_METRICS_PATH
+        or predictions_path != TREE_MODEL_PREDICTIONS_PATH
+        or importance_path != TREE_MODEL_IMPORTANCE_PATH
+        or rankings_path != TREE_MODEL_FACTOR_RANKINGS_PATH
     ):
         raise RuntimeError("Training returned paths that disagree with config.py")
     print(
-        "Training: saved "
-        f"{metrics_path}, {coefficients_path}, and {predictions_path}"
+        "Random-forest training: saved "
+        f"{metrics_path}, {predictions_path}, {importance_path}, and "
+        f"{rankings_path}"
     )
     print("Pipeline complete")
 

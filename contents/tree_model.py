@@ -1,14 +1,13 @@
-"""Train decision-tree and random-forest FOMC decision classifiers.
+"""Train and evaluate the project's FOMC random-forest classifier.
 
-This is a standalone comparison model. It consumes the same validated feature
-panel and chronological holdout as ``model.py`` but predicts the three decision
-classes directly. Hyperparameters and the winning model family are selected
-only with forward cross-validation inside the training period.
+The model predicts cut, hold, or hike directly. Hyperparameters are selected
+only with forward cross-validation inside the chronological training period.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -25,13 +24,13 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from sklearn.tree import DecisionTreeClassifier
 
 from config import (
     CV_SPLITS,
     DECISION_CLASSES,
     DIAGNOSTIC_TARGET,
     FEATURE_COLUMNS,
+    FEATURE_PANEL_PATH,
     MODEL_TEST_FRACTION,
     RANDOM_STATE,
     TREE_MODEL_FACTOR_RANKINGS_PATH,
@@ -39,10 +38,48 @@ from config import (
     TREE_MODEL_METRICS_PATH,
     TREE_MODEL_PREDICTIONS_PATH,
 )
-from model import chronological_train_test_split, load_feature_panel
+from features import validate_feature_panel
 
 
 FACTOR_RANKING_LIMIT = 10
+
+
+def load_feature_panel() -> pd.DataFrame:
+    """Load and validate the configured model feature panel."""
+    if not FEATURE_PANEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Missing {FEATURE_PANEL_PATH}; run features.py first"
+        )
+    panel = pd.read_csv(FEATURE_PANEL_PATH)
+    panel["meeting_date"] = pd.to_datetime(
+        panel["meeting_date"], errors="coerce"
+    )
+    validate_feature_panel(panel)
+    return panel
+
+
+def chronological_train_test_split(
+    panel: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reserve the newest configured fraction as the final holdout."""
+    validate_feature_panel(panel)
+    if not 0 < MODEL_TEST_FRACTION < 1:
+        raise ValueError("MODEL_TEST_FRACTION must be between zero and one")
+    test_size = math.ceil(len(panel) * MODEL_TEST_FRACTION)
+    split_position = len(panel) - test_size
+    train = panel.iloc[:split_position].copy().reset_index(drop=True)
+    test = panel.iloc[split_position:].copy().reset_index(drop=True)
+    if (
+        train.empty
+        or test.empty
+        or train["meeting_date"].max() >= test["meeting_date"].min()
+    ):
+        raise ValueError("Chronological train/test split is invalid")
+    required_classes = set(DECISION_CLASSES)
+    for name, partition in (("train", train), ("test", test)):
+        if set(partition[DIAGNOSTIC_TARGET].astype(str)) != required_classes:
+            raise ValueError(f"{name} lacks a decision class")
+    return train, test
 
 
 def build_chronological_cv(target: pd.Series) -> TimeSeriesSplit:
@@ -77,30 +114,6 @@ def build_chronological_cv(target: pd.Series) -> TimeSeriesSplit:
         if train_index.max() >= validation_index.min():
             raise RuntimeError("cross-validation fold is not chronological")
     return splitter
-
-
-def tune_decision_tree(
-    features: pd.DataFrame,
-    target: pd.Series,
-    cv: TimeSeriesSplit,
-) -> GridSearchCV:
-    """Tune a single decision tree with forward cross-validation."""
-    search = GridSearchCV(
-        estimator=DecisionTreeClassifier(random_state=RANDOM_STATE),
-        param_grid={
-            "criterion": ["gini", "entropy"],
-            "max_depth": [3, 5, 8, None],
-            "min_samples_leaf": [1, 3, 5, 10],
-            "class_weight": [None, "balanced"],
-        },
-        scoring="f1_macro",
-        cv=cv,
-        refit=True,
-        n_jobs=-1,
-        error_score="raise",
-    )
-    search.fit(features, target)
-    return search
 
 
 def tune_random_forest(
@@ -165,106 +178,93 @@ def calculate_metrics(
 
 def build_prediction_table(
     test: pd.DataFrame,
-    searches: dict[str, GridSearchCV],
-    selected_model: str,
+    search: GridSearchCV,
 ) -> pd.DataFrame:
-    """Return predictions and class probabilities for both model families."""
+    """Return random-forest predictions and class probabilities."""
     features = test.loc[:, FEATURE_COLUMNS]
+    estimator = search.best_estimator_
+    model_prediction = estimator.predict(features)
+    model_probabilities = estimator.predict_proba(features)
+    class_positions = {
+        label: index for index, label in enumerate(estimator.classes_)
+    }
     predictions = pd.DataFrame(
         {
             "meeting_date": test["meeting_date"].to_numpy(),
             "actual_decision": test[DIAGNOSTIC_TARGET].astype(str).to_numpy(),
+            "random_forest_prediction": model_prediction,
+            "random_forest_correct": (
+                model_prediction
+                == test[DIAGNOSTIC_TARGET].astype(str).to_numpy()
+            ),
         }
     )
-
-    for model_name, search in searches.items():
-        estimator = search.best_estimator_
-        model_prediction = estimator.predict(features)
-        model_probabilities = estimator.predict_proba(features)
-        class_positions = {
-            label: index for index, label in enumerate(estimator.classes_)
-        }
-        predictions[f"{model_name}_prediction"] = model_prediction
-        predictions[f"{model_name}_correct"] = (
-            model_prediction == predictions["actual_decision"]
+    for label in DECISION_CLASSES:
+        predictions[f"random_forest_probability_{label}"] = (
+            model_probabilities[:, class_positions[label]]
         )
-        for label in DECISION_CLASSES:
-            predictions[f"{model_name}_probability_{label}"] = (
-                model_probabilities[:, class_positions[label]]
-            )
-
-    predictions["selected_model"] = selected_model
-    predictions["selected_prediction"] = predictions[
-        f"{selected_model}_prediction"
-    ]
-    predictions["selected_correct"] = predictions[
-        f"{selected_model}_correct"
-    ]
     return predictions
 
 
 def build_feature_importance_table(
-    searches: dict[str, GridSearchCV],
+    search: GridSearchCV,
 ) -> pd.DataFrame:
-    """Return impurity-based feature importances for both fitted estimators."""
-    importance = pd.DataFrame({"feature": FEATURE_COLUMNS})
-    for model_name, search in searches.items():
-        values = search.best_estimator_.feature_importances_
-        importance[f"{model_name}_importance"] = values
-        importance[f"{model_name}_rank"] = (
-            pd.Series(values).rank(method="min", ascending=False).astype(int)
-        )
+    """Return the fitted random forest's impurity-based importances."""
+    values = search.best_estimator_.feature_importances_
+    importance = pd.DataFrame(
+        {
+            "feature": FEATURE_COLUMNS,
+            "random_forest_importance": values,
+            "random_forest_rank": (
+                pd.Series(values).rank(method="min", ascending=False).astype(int)
+            ),
+        }
+    )
     return importance.sort_values(
-        ["random_forest_rank", "decision_tree_rank", "feature"]
+        ["random_forest_rank", "feature"]
     ).reset_index(drop=True)
 
 
 def build_factor_ranking_table(
     importance: pd.DataFrame,
 ) -> pd.DataFrame:
-    """List the most and least influential features for both model families.
+    """List the most and least influential random-forest features.
 
     Influence is the fitted estimator's impurity-based ``feature_importances_``
     value. Zero-importance features are omitted from the most-influential list
     but retained in the least-influential list. Alphabetical order breaks ties.
     """
+    importance_column = "random_forest_importance"
+    if importance_column not in importance.columns:
+        raise ValueError(f"importance is missing {importance_column}")
+    ordered_most = importance.sort_values(
+        [importance_column, "feature"], ascending=[False, True]
+    )
+    ordered_most = ordered_most.loc[
+        ordered_most[importance_column] > 0
+    ].head(FACTOR_RANKING_LIMIT)
+    ordered_least = importance.sort_values(
+        [importance_column, "feature"], ascending=[True, True]
+    ).head(FACTOR_RANKING_LIMIT)
+
     records: list[dict[str, Any]] = []
-    for model_name in ("decision_tree", "random_forest"):
-        importance_column = f"{model_name}_importance"
-        if importance_column not in importance.columns:
-            raise ValueError(f"importance is missing {importance_column}")
-
-        ordered_most = importance.sort_values(
-            [importance_column, "feature"],
-            ascending=[False, True],
-        )
-        ordered_most = ordered_most.loc[
-            ordered_most[importance_column] > 0
-        ].head(FACTOR_RANKING_LIMIT)
-        ordered_least = importance.sort_values(
-            [importance_column, "feature"],
-            ascending=[True, True],
-        ).head(FACTOR_RANKING_LIMIT)
-
-        for influence_group, ranked_rows in (
-            ("most_influential", ordered_most),
-            ("least_influential", ordered_least),
-        ):
-            for rank, (_, row) in enumerate(ranked_rows.iterrows(), start=1):
-                records.append(
-                    {
-                        "model": model_name,
-                        "influence_group": influence_group,
-                        "rank": rank,
-                        "feature": row["feature"],
-                        "importance": float(row[importance_column]),
-                    }
-                )
+    for influence_group, ranked_rows in (
+        ("most_influential", ordered_most),
+        ("least_influential", ordered_least),
+    ):
+        for rank, (_, row) in enumerate(ranked_rows.iterrows(), start=1):
+            records.append(
+                {
+                    "influence_group": influence_group,
+                    "rank": rank,
+                    "feature": row["feature"],
+                    "importance": float(row[importance_column]),
+                }
+            )
 
     return pd.DataFrame.from_records(
         records,
         columns=[
-            "model",
             "influence_group",
             "rank",
             "feature",
@@ -274,23 +274,20 @@ def build_factor_ranking_table(
 
 
 def factor_rankings_for_json(rankings: pd.DataFrame) -> dict[str, Any]:
-    """Convert the ranking table into model/group lists for metrics JSON."""
+    """Convert the ranking table into group lists for metrics JSON."""
     result: dict[str, Any] = {}
-    for model_name in ("decision_tree", "random_forest"):
-        result[model_name] = {}
-        model_rows = rankings.loc[rankings["model"].eq(model_name)]
-        for influence_group in ("most_influential", "least_influential"):
-            group_rows = model_rows.loc[
-                model_rows["influence_group"].eq(influence_group)
-            ].sort_values("rank")
-            result[model_name][influence_group] = [
-                {
-                    "rank": int(row["rank"]),
-                    "feature": str(row["feature"]),
-                    "importance": float(row["importance"]),
-                }
-                for _, row in group_rows.iterrows()
-            ]
+    for influence_group in ("most_influential", "least_influential"):
+        group_rows = rankings.loc[
+            rankings["influence_group"].eq(influence_group)
+        ].sort_values("rank")
+        result[influence_group] = [
+            {
+                "rank": int(row["rank"]),
+                "feature": str(row["feature"]),
+                "importance": float(row["importance"]),
+            }
+            for _, row in group_rows.iterrows()
+        ]
     return result
 
 
@@ -355,8 +352,8 @@ def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
         raise
 
 
-def train_tree_models() -> tuple[Path, Path, Path, Path]:
-    """Train, compare, evaluate, and save both tree-based classifiers."""
+def train_random_forest() -> tuple[Path, Path, Path, Path]:
+    """Tune, evaluate, and save the random-forest classifier."""
     panel = load_feature_panel()
     train, test = chronological_train_test_split(panel)
     training_features = train.loc[:, FEATURE_COLUMNS]
@@ -364,31 +361,11 @@ def train_tree_models() -> tuple[Path, Path, Path, Path]:
     test_target = test[DIAGNOSTIC_TARGET].astype(str)
     cv = build_chronological_cv(training_target)
 
-    searches = {
-        "decision_tree": tune_decision_tree(
-            training_features, training_target, cv
-        ),
-        "random_forest": tune_random_forest(
-            training_features, training_target, cv
-        ),
-    }
-    selected_model = max(
-        searches,
-        key=lambda name: (float(searches[name].best_score_), name == "random_forest"),
+    search = tune_random_forest(training_features, training_target, cv)
+    holdout_prediction = search.best_estimator_.predict(
+        test.loc[:, FEATURE_COLUMNS]
     )
-
-    model_metrics: dict[str, Any] = {}
-    for model_name, search in searches.items():
-        holdout_prediction = search.best_estimator_.predict(
-            test.loc[:, FEATURE_COLUMNS]
-        )
-        model_metrics[model_name] = {
-            "best_cv_macro_f1": float(search.best_score_),
-            "best_parameters": search.best_params_,
-            "holdout": calculate_metrics(test_target, holdout_prediction),
-        }
-
-    importance = build_feature_importance_table(searches)
+    importance = build_feature_importance_table(search)
     factor_rankings = build_factor_ranking_table(importance)
     metrics = {
         "methodology": {
@@ -409,19 +386,21 @@ def train_tree_models() -> tuple[Path, Path, Path, Path]:
             "test_first_meeting": test["meeting_date"].min().date().isoformat(),
             "test_last_meeting": test["meeting_date"].max().date().isoformat(),
         },
-        "selected_model": selected_model,
-        "models": model_metrics,
+        "model": "random_forest",
+        "best_cv_macro_f1": float(search.best_score_),
+        "best_parameters": search.best_params_,
+        "holdout": calculate_metrics(test_target, holdout_prediction),
         "feature_influence": {
             "method": "mean decrease in impurity (feature_importances_)",
             "caution": (
                 "Correlated features can divide or exchange importance; zero "
-                "importance in one fitted tree is not proof of no economic value."
+                "importance in the fitted forest is not proof of no economic value."
             ),
             "ranking_limit_per_group": FACTOR_RANKING_LIMIT,
             "rankings": factor_rankings_for_json(factor_rankings),
         },
     }
-    predictions = build_prediction_table(test, searches, selected_model)
+    predictions = build_prediction_table(test, search)
 
     _atomic_write_json(metrics, TREE_MODEL_METRICS_PATH)
     _atomic_write_csv(predictions, TREE_MODEL_PREDICTIONS_PATH)
@@ -436,24 +415,22 @@ def train_tree_models() -> tuple[Path, Path, Path, Path]:
 
 
 def main() -> None:
-    """Train both tree models and report their holdout results."""
+    """Train the random forest and report its holdout results."""
     (
         metrics_path,
         predictions_path,
         importance_path,
         factor_rankings_path,
-    ) = train_tree_models()
+    ) = train_random_forest()
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-    print(f"Selected by training CV: {metrics['selected_model']}")
-    for model_name, model_result in metrics["models"].items():
-        holdout = model_result["holdout"]
-        print(
-            f"Test split: {(1 - MODEL_TEST_FRACTION)*100:.0f}/{MODEL_TEST_FRACTION*100:.0f}\n"
-            f"{model_name}: cv_macro_f1={model_result['best_cv_macro_f1']:.3f}, "
-            f"holdout_accuracy={holdout['accuracy']:.3f}, "
-            f"holdout_balanced_accuracy={holdout['balanced_accuracy']:.3f}, "
-            f"holdout_macro_f1={holdout['macro_f1']:.3f}"
-        )
+    holdout = metrics["holdout"]
+    print(
+        f"Test split: {(1 - MODEL_TEST_FRACTION)*100:.0f}/{MODEL_TEST_FRACTION*100:.0f}\n"
+        f"random_forest: cv_macro_f1={metrics['best_cv_macro_f1']:.3f}, "
+        f"holdout_accuracy={holdout['accuracy']:.3f}, "
+        f"holdout_balanced_accuracy={holdout['balanced_accuracy']:.3f}, "
+        f"holdout_macro_f1={holdout['macro_f1']:.3f}"
+    )
     print(f"Saved metrics to {metrics_path}")
     print(f"Saved predictions to {predictions_path}")
     print(f"Saved feature importances to {importance_path}")

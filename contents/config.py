@@ -5,7 +5,7 @@ Keep configuration here and implementation in the stage modules:
 1. ``pull_from_apis.py`` and ``scrape.py`` acquire raw inputs.
 2. ``clean.py`` aligns observations and creates decision labels.
 3. ``features.py`` creates information available before each meeting.
-4. ``model.py`` trains and evaluates logistic-regression models.
+4. ``tree_model.py`` trains and evaluates a random-forest classifier.
 
 Only the structured series in ``FRED_SERIES`` and the FOMC meeting calendar
 may enter the modeling panel. ``SUPPLEMENTARY_SOURCES`` is coverage metadata
@@ -52,10 +52,6 @@ FEATURE_PANEL_PATH: Final = DATA_PROCESSED / "feature_panel.csv"
 SOURCE_SCRAPE_JSONL_PATH: Final = DATA_RAW / "source_scrape.jsonl"
 SOURCE_SCRAPE_SUMMARY_PATH: Final = DATA_RAW / "source_scrape_summary.csv"
 OUTPUTS: Final = PROJECT_DIR / "outputs"
-MODEL_METRICS_PATH: Final = OUTPUTS / "metrics.json"
-MODEL_COEFFICIENTS_PATH: Final = OUTPUTS / "coefficients.csv"
-MODEL_PREDICTIONS_PATH: Final = OUTPUTS / "predictions.csv"
-PREDICTION_VISUALIZER_PATH: Final = OUTPUTS / "prediction_visualizer.ipynb"
 RANDOM_FOREST_VISUALIZER_PATH: Final = OUTPUTS / "random_forest_visualizer.ipynb"
 TREE_MODEL_METRICS_PATH: Final = OUTPUTS / "tree_model_metrics.json"
 TREE_MODEL_PREDICTIONS_PATH: Final = OUTPUTS / "tree_model_predictions.csv"
@@ -243,26 +239,9 @@ DECISION_CLASSES: Final[tuple[str, ...]] = ("cut", "hold", "hike")
 POLICY_REGIMES: Final[tuple[str, ...]] = ("point_target", "target_range")
 PRIMARY_TARGET: Final = "is_change"
 DIAGNOSTIC_TARGET: Final = "decision"
-DIRECTION_TARGET: Final = "direction"
 RANDOM_STATE: Final = 42
 CV_SPLITS: Final = 5
-LOGISTIC_C_VALUES: Final[tuple[float, ...]] = (0.1, 0.5, 1.0, 2.0)
 MODEL_TEST_FRACTION: Final = 0.2
-LOGISTIC_MAX_ITERATIONS: Final = 5_000
-PRIMARY_MODEL_SCORING: Final = "balanced_accuracy"
-DIAGNOSTIC_MODEL_SCORING: Final = "f1_macro"
-
-# Hierarchical model and decision-policy search. Every value is selected using
-# chronological training folds; the final holdout never chooses a threshold.
-PRIMARY_CLASS_WEIGHT_OPTIONS: Final[tuple[str | None, ...]] = (None, "balanced")
-DIRECTION_CUT_WEIGHT_OPTIONS: Final[tuple[float, ...]] = (1.0, 1.5, 2.0, 3.0)
-CHANGE_THRESHOLD_VALUES: Final[tuple[float, ...]] = (0.35, 0.45, 0.5, 0.55, 0.65)
-DIRECTION_CUT_THRESHOLD_VALUES: Final[tuple[float, ...]] = (0.4, 0.5, 0.6)
-CUT_OVERRIDE_MIN_CHANGE_VALUES: Final[tuple[float, ...]] = (0.25, 0.35, 0.45)
-CUT_OVERRIDE_DIRECTION_VALUES: Final[tuple[float, ...]] = (0.75, 0.85, 0.9)
-CUT_OVERRIDE_JOINT_VALUES: Final[tuple[float, ...]] = (0.2, 0.25, 0.3)
-DECISION_POLICY_SCORING: Final = "f1_macro"
-MODEL_SELECTION_SCORE_TOLERANCE: Final = 0.02
 
 # Bond-market series used by the estimator. All requested market series are
 # acquired above, but later-inception TIPS, breakeven, and corporate-spread
