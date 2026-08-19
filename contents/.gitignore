@@ -4,6 +4,7 @@ outputs/*
 !data/raw/.gitkeep
 !data/clean/.gitkeep
 !outputs/.gitkeep
+!outputs/random_forest_visualizer.ipynb
 .env
 .env.*
 !.env.example
