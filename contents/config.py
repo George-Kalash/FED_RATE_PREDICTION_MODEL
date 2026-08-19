@@ -28,7 +28,7 @@ class FredSeriesSpec(TypedDict):
 
     series_id: str
     frequency: Literal["daily", "monthly", "quarterly"]
-    role: Literal["policy", "inflation", "labour"]
+    role: Literal["policy", "inflation", "labour", "market"]
     description: str
 
 
@@ -131,6 +131,102 @@ FRED_SERIES: Final[dict[str, FredSeriesSpec]] = {
         "role": "labour",
         "description": "CBO estimate of the natural unemployment rate",
     },
+    "treasury_3m_pct": {
+        "series_id": "DGS3MO",
+        "frequency": "daily",
+        "role": "market",
+        "description": "3-month Treasury constant-maturity yield (percent)",
+    },
+    "treasury_6m_pct": {
+        "series_id": "DGS6MO",
+        "frequency": "daily",
+        "role": "market",
+        "description": "6-month Treasury constant-maturity yield (percent)",
+    },
+    "treasury_1y_pct": {
+        "series_id": "DGS1",
+        "frequency": "daily",
+        "role": "market",
+        "description": "1-year Treasury constant-maturity yield (percent)",
+    },
+    "treasury_2y_pct": {
+        "series_id": "DGS2",
+        "frequency": "daily",
+        "role": "market",
+        "description": "2-year Treasury constant-maturity yield (percent)",
+    },
+    "treasury_5y_pct": {
+        "series_id": "DGS5",
+        "frequency": "daily",
+        "role": "market",
+        "description": "5-year Treasury constant-maturity yield (percent)",
+    },
+    "treasury_10y_pct": {
+        "series_id": "DGS10",
+        "frequency": "daily",
+        "role": "market",
+        "description": "10-year Treasury constant-maturity yield (percent)",
+    },
+    "treasury_30y_pct": {
+        "series_id": "DGS30",
+        "frequency": "daily",
+        "role": "market",
+        "description": "30-year Treasury constant-maturity yield (percent)",
+    },
+    "real_5y_tips_pct": {
+        "series_id": "DFII5",
+        "frequency": "daily",
+        "role": "market",
+        "description": "5-year inflation-indexed Treasury yield (percent)",
+    },
+    "real_10y_tips_pct": {
+        "series_id": "DFII10",
+        "frequency": "daily",
+        "role": "market",
+        "description": "10-year inflation-indexed Treasury yield (percent)",
+    },
+    "real_30y_tips_pct": {
+        "series_id": "DFII30",
+        "frequency": "daily",
+        "role": "market",
+        "description": "30-year inflation-indexed Treasury yield (percent)",
+    },
+    "curve_10y_minus_2y_pct": {
+        "series_id": "T10Y2Y",
+        "frequency": "daily",
+        "role": "market",
+        "description": "10-year minus 2-year Treasury spread (percentage points)",
+    },
+    "curve_10y_minus_3m_pct": {
+        "series_id": "T10Y3M",
+        "frequency": "daily",
+        "role": "market",
+        "description": "10-year minus 3-month Treasury spread (percentage points)",
+    },
+    "breakeven_inflation_5y_pct": {
+        "series_id": "T5YIE",
+        "frequency": "daily",
+        "role": "market",
+        "description": "5-year breakeven inflation rate (percent)",
+    },
+    "breakeven_inflation_10y_pct": {
+        "series_id": "T10YIE",
+        "frequency": "daily",
+        "role": "market",
+        "description": "10-year breakeven inflation rate (percent)",
+    },
+    "investment_grade_oas_pct": {
+        "series_id": "BAMLC0A0CM",
+        "frequency": "daily",
+        "role": "market",
+        "description": "ICE BofA US corporate option-adjusted spread (percent)",
+    },
+    "high_yield_oas_pct": {
+        "series_id": "BAMLH0A0HYM2",
+        "frequency": "daily",
+        "role": "market",
+        "description": "ICE BofA US high-yield option-adjusted spread (percent)",
+    },
 }
 
 # Model and label declarations.
@@ -163,6 +259,37 @@ CUT_OVERRIDE_JOINT_VALUES: Final[tuple[float, ...]] = (0.2, 0.25, 0.3)
 DECISION_POLICY_SCORING: Final = "f1_macro"
 MODEL_SELECTION_SCORE_TOLERANCE: Final = 0.02
 
+# Bond-market series used by the estimator. All requested market series are
+# acquired above, but later-inception TIPS, breakeven, and corporate-spread
+# series remain raw research inputs so they do not eliminate pre-2008 meetings.
+# DGS30 is also retained only as a raw input because its 2002-2006 publication
+# gap cannot be filled without introducing stale or synthetic observations.
+BOND_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
+    "treasury_3m_pct",
+    "treasury_6m_pct",
+    "treasury_1y_pct",
+    "treasury_2y_pct",
+    "treasury_5y_pct",
+    "treasury_10y_pct",
+    "curve_10y_minus_2y_pct",
+    "curve_10y_minus_3m_pct",
+)
+BOND_FEATURE_MAX_AGE_DAYS: Final = 10
+
+# Derived term spreads relative to the official federal-funds target in force
+# immediately before each meeting. Each tuple is ``(yield, derived spread)``.
+TREASURY_FUNDS_SPREADS: Final[tuple[tuple[str, str], ...]] = (
+    ("treasury_3m_pct", "treasury_3m_minus_funds_pct"),
+    ("treasury_6m_pct", "treasury_6m_minus_funds_pct"),
+    ("treasury_1y_pct", "treasury_1y_minus_funds_pct"),
+    ("treasury_2y_pct", "treasury_2y_minus_funds_pct"),
+    ("treasury_5y_pct", "treasury_5y_minus_funds_pct"),
+    ("treasury_10y_pct", "treasury_10y_minus_funds_pct"),
+)
+TREASURY_FUNDS_SPREAD_COLUMNS: Final[tuple[str, ...]] = tuple(
+    spread_column for _, spread_column in TREASURY_FUNDS_SPREADS
+)
+
 FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "rate_level",
     "rate_chg_1m",
@@ -178,6 +305,8 @@ FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     "unemp_ma3",
     "natural_unemployment",
     "abs_inflation_gap",
+    *BOND_FEATURE_COLUMNS,
+    *TREASURY_FUNDS_SPREAD_COLUMNS,
     "is_scheduled",
     "prior_decision",
     "prior_is_change",

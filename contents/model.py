@@ -924,6 +924,7 @@ def main() -> None:
     print(f"Saved coefficients to {coefficients_path}")
     print(f"Saved holdout predictions to {predictions_path}")
     print(
+        f"Test split: {(1 - MODEL_TEST_FRACTION)*100:.0f}/{MODEL_TEST_FRACTION*100:.0f}\n  "
         "Holdout change model: "
         f"accuracy={binary['accuracy']:.3f}, "
         f"balanced_accuracy={binary['balanced_accuracy']:.3f}, "

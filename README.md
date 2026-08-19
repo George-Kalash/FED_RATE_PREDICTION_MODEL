@@ -2,7 +2,7 @@
 
 An educational, reproducible pipeline for modeling Federal Open Market
 Committee (FOMC) policy decisions from U.S. policy-rate, inflation, labour, and
-strictly lagged meeting-history data.
+strictly pre-meeting Treasury-market and meeting-history data.
 
 The project follows four modeling stages:
 
@@ -51,6 +51,7 @@ not used as model input.
 Official structured inputs
   |- FRED policy target series
   |- FRED PCE, unemployment, and natural unemployment
+  |- FRED Treasury yields, curve spreads, and research-only market series
   `- Official Federal Reserve FOMC meeting calendar
                 |
                 v
@@ -65,7 +66,7 @@ Official structured inputs
                 |
                 v
   features.py: macro momentum, rolling averages, policy context,
-               and strictly lagged meeting-cycle features
+               prior-market closes, and lagged meeting-cycle features
                 |
                 v
        data/clean/feature_panel.csv
@@ -102,6 +103,11 @@ structured modeling backbone.
 | `pce_index` | FRED | `PCEPI` | Monthly | PCE price-index level used to calculate year-over-year inflation |
 | `unemployment` | FRED | `UNRATE` | Monthly | U-3 civilian unemployment rate, seasonally adjusted |
 | `natural_unemployment` | FRED | `NROU` | Quarterly | CBO estimate of the natural rate of unemployment |
+| `treasury_3m_pct` through `treasury_30y_pct` | FRED | `DGS3MO`, `DGS6MO`, `DGS1`, `DGS2`, `DGS5`, `DGS10`, `DGS30` | Daily | Nominal Treasury yield curve |
+| `curve_10y_minus_2y_pct`, `curve_10y_minus_3m_pct` | FRED | `T10Y2Y`, `T10Y3M` | Daily | Treasury curve slopes |
+| `real_5y_tips_pct`, `real_10y_tips_pct`, `real_30y_tips_pct` | FRED | `DFII5`, `DFII10`, `DFII30` | Daily | Inflation-indexed Treasury yields; acquired for research |
+| `breakeven_inflation_5y_pct`, `breakeven_inflation_10y_pct` | FRED | `T5YIE`, `T10YIE` | Daily | Market-implied inflation; acquired for research |
+| `investment_grade_oas_pct`, `high_yield_oas_pct` | FRED | `BAMLC0A0CM`, `BAMLH0A0HYM2` | Daily | Corporate credit spreads; acquired for research |
 | FOMC calendar | Federal Reserve | Official current and historical calendar pages | Meeting-level | Decision dates, scheduled status, and auditable source URLs |
 
 FRED observations are downloaded from:
@@ -114,6 +120,14 @@ The FOMC calendar parser reads the current calendar and official historical
 pages. For a two-day meeting, the final day is stored as the decision date.
 Historical conference calls are retained only when the official page identifies
 a policy statement.
+
+All 16 declared market series are downloaded. The estimator currently uses the
+six nominal Treasury maturities from 3 months through 10 years and the two
+declared curve spreads. This subset preserves meetings before and after 2008.
+TIPS and breakeven series begin in 2003, the configured corporate-spread series
+currently begin in 2023, and the 30-year Treasury series has a 2002-2006
+publication gap, so those series remain raw research inputs rather than forcing
+the training panel to discard earlier meetings or silently impute long gaps.
 
 ### Supplementary coverage sources
 
@@ -210,6 +224,8 @@ Central configuration lives in `contents/config.py`.
 | `PIPELINE_FRED_OBSERVATION_START` | Optional FRED observation lower bound; `None` requests all available history |
 | `PIPELINE_SCRAPE_COVERAGE` | Whether the end-to-end pipeline also runs the optional coverage scraper |
 | `FRED_SERIES` | Logical input names, FRED IDs, frequencies, and modeling roles |
+| `BOND_FEATURE_COLUMNS` | Market series permitted to enter the current estimator |
+| `BOND_FEATURE_MAX_AGE_DAYS` | Maximum accepted age of a prior-market observation |
 | `FEATURE_COLUMNS` | Exact ordered model feature schema |
 | `MODEL_TEST_FRACTION` | Newest chronological fraction reserved as holdout |
 | `CV_SPLITS` | Number of forward cross-validation splits |
@@ -269,7 +285,7 @@ Stage dependencies are strict:
 
 | Script | Requires | Main outputs |
 |---|---|---|
-| `pull_from_apis.py` | FRED key and network | Six raw FRED CSVs and `fomc_meetings.csv` |
+| `pull_from_apis.py` | FRED key and network | 22 raw FRED CSVs and `fomc_meetings.csv` |
 | `clean.py` | Complete raw inputs | `clean_panel.csv` |
 | `features.py` | Clean panel plus raw histories | `feature_panel.csv` |
 | `model.py` | Feature panel | Metrics, coefficients, predictions |
@@ -375,7 +391,7 @@ fields are excluded from the feature panel.
 
 ## Model features
 
-The configured model uses 24 numeric features.
+The configured model uses 38 numeric features.
 
 ### Policy-rate features
 
@@ -405,6 +421,31 @@ The configured model uses 24 numeric features.
 | `unemp_chg3` | Three-month unemployment-rate change |
 | `unemp_ma3` | Three-month trailing unemployment average |
 | `natural_unemployment` | Latest aligned CBO natural-rate estimate |
+
+### Bond-market features
+
+Each value is the latest non-missing FRED observation **strictly before** the
+meeting date. Exact meeting-date matches are disabled because a daily close can
+occur after an FOMC announcement. An observation older than
+`BOND_FEATURE_MAX_AGE_DAYS` causes validation to fail instead of being silently
+carried forward.
+
+| Feature | Definition |
+|---|---|
+| `treasury_3m_pct` | Prior-close 3-month Treasury yield |
+| `treasury_6m_pct` | Prior-close 6-month Treasury yield |
+| `treasury_1y_pct` | Prior-close 1-year Treasury yield |
+| `treasury_2y_pct` | Prior-close 2-year Treasury yield |
+| `treasury_5y_pct` | Prior-close 5-year Treasury yield |
+| `treasury_10y_pct` | Prior-close 10-year Treasury yield |
+| `curve_10y_minus_2y_pct` | Prior-close 10-year minus 2-year spread |
+| `curve_10y_minus_3m_pct` | Prior-close 10-year minus 3-month spread |
+| `treasury_3m_minus_funds_pct` | 3-month Treasury yield minus the pre-meeting funds target |
+| `treasury_6m_minus_funds_pct` | 6-month Treasury yield minus the pre-meeting funds target |
+| `treasury_1y_minus_funds_pct` | 1-year Treasury yield minus the pre-meeting funds target |
+| `treasury_2y_minus_funds_pct` | 2-year Treasury yield minus the pre-meeting funds target |
+| `treasury_5y_minus_funds_pct` | 5-year Treasury yield minus the pre-meeting funds target |
+| `treasury_10y_minus_funds_pct` | 10-year Treasury yield minus the pre-meeting funds target |
 
 ### Meeting-cycle features
 
@@ -516,6 +557,7 @@ All generated data is ignored by Git except for `.gitkeep` placeholders.
 | `pce_index.csv` | Monthly PCE index observations |
 | `unemployment.csv` | Monthly unemployment observations |
 | `natural_unemployment.csv` | Quarterly NROU observations |
+| `<market_logical_name>.csv` | One raw file for each of the 16 Treasury, TIPS, breakeven, curve, and corporate-spread series |
 | `fomc_meetings.csv` | Decision date, scheduled flag, and source URL |
 | `source_scrape.jsonl` | Optional detailed coverage scrape |
 | `source_scrape_summary.csv` | Optional compact scrape summary |
@@ -712,6 +754,7 @@ The pipeline fails loudly when a data contract is violated.
 - exact configured schema and order;
 - numeric, finite, non-constant features;
 - strict lags for target-derived meeting history;
+- bond observations strictly before each meeting and no more than the configured age limit;
 - no known post-meeting label fields in `FEATURE_COLUMNS`;
 - valid decision classes and binary targets; and
 - arithmetic identities such as the absolute inflation gap.
@@ -758,7 +801,7 @@ The current model does not include:
 
 - historical fed-funds-futures or market-implied meeting probabilities;
 - survey consensus available before each meeting;
-- real-time payroll, GDP, financial-condition, or inflation-release vintages;
+- real-time payroll, GDP, broader financial-condition, or inflation-release vintages;
 - FOMC communication text transformed into timestamped features; or
 - a persisted production estimator and live next-meeting inference command.
 

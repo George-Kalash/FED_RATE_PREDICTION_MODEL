@@ -14,6 +14,8 @@ from clean import (
     validate_clean_panel,
 )
 from config import (
+    BOND_FEATURE_COLUMNS,
+    BOND_FEATURE_MAX_AGE_DAYS,
     CLEAN_PANEL_PATH,
     DATA_RAW,
     DECISION_CLASSES,
@@ -26,6 +28,8 @@ from config import (
     INFLATION_AVERAGE_WINDOWS_MONTHS,
     INFLATION_CHANGE_WINDOWS_MONTHS,
     RATE_CHANGE_WINDOWS_MONTHS,
+    TREASURY_FUNDS_SPREAD_COLUMNS,
+    TREASURY_FUNDS_SPREADS,
     UNEMPLOYMENT_AVERAGE_WINDOWS_MONTHS,
     UNEMPLOYMENT_CHANGE_WINDOWS_MONTHS,
 )
@@ -354,6 +358,113 @@ def add_policy_context_features(panel: "pd.DataFrame") -> "pd.DataFrame":
     return featured
 
 
+def add_bond_market_features(panel: "pd.DataFrame") -> "pd.DataFrame":
+    """Align prior bond closes and derive Treasury-minus-funds spreads.
+
+    FRED's Treasury series are daily observations with weekends, holidays, and
+    occasional missing values. For each configured series, this function drops
+    unavailable observations and performs a backward as-of join with exact
+    meeting-date matches disabled. The retained reference-date columns are
+    temporary audit fields; ``select_model_columns`` removes them before model
+    training.
+    """
+    if not isinstance(panel, pd.DataFrame):
+        raise TypeError("panel must be a pandas DataFrame")
+    if panel.empty:
+        raise ValueError("panel contains no meetings")
+    required_columns = {"meeting_date", "rate_level"}
+    missing = sorted(required_columns - set(panel.columns))
+    if missing:
+        raise ValueError(f"panel is missing bond-feature inputs: {missing}")
+
+    featured = panel.copy()
+    featured["meeting_date"] = pd.to_datetime(
+        featured["meeting_date"], errors="coerce"
+    )
+    if featured["meeting_date"].isna().any():
+        raise ValueError("panel contains missing or invalid meeting_date")
+    if featured["meeting_date"].duplicated().any():
+        raise ValueError("panel contains duplicate meeting dates")
+    if not featured["meeting_date"].is_monotonic_increasing:
+        raise ValueError("panel must be sorted before aligning bond-market data")
+    featured["rate_level"] = pd.to_numeric(
+        featured["rate_level"], errors="coerce"
+    )
+    if featured["rate_level"].isna().any():
+        raise ValueError("panel contains missing or invalid rate_level")
+
+    meeting_rows = pd.DataFrame(
+        {
+            "_row_id": np.arange(len(featured)),
+            "meeting_date": featured["meeting_date"],
+        }
+    ).sort_values("meeting_date")
+
+    for feature_column in BOND_FEATURE_COLUMNS:
+        raw_path = DATA_RAW / f"{feature_column}.csv"
+        market_history = load_raw_series(raw_path, feature_column)
+        market_history[feature_column] = pd.to_numeric(
+            market_history[feature_column], errors="coerce"
+        )
+        market_history = (
+            market_history.dropna(subset=[feature_column])
+            .sort_values("date")
+            .drop_duplicates(subset="date", keep="last")
+        )
+        if market_history.empty:
+            raise ValueError(f"{raw_path.name} contains no numeric observations")
+
+        reference_column = f"{feature_column}_reference_date"
+        aligned = pd.merge_asof(
+            meeting_rows,
+            market_history.rename(columns={"date": reference_column}),
+            left_on="meeting_date",
+            right_on=reference_column,
+            direction="backward",
+            allow_exact_matches=False,
+        ).sort_values("_row_id")
+
+        if aligned[[reference_column, feature_column]].isna().any().any():
+            missing_meetings = aligned.loc[
+                aligned[feature_column].isna(), "meeting_date"
+            ].dt.strftime("%Y-%m-%d").tolist()
+            raise ValueError(
+                f"{feature_column} has no observation before meetings: "
+                f"{missing_meetings}"
+            )
+        if (aligned[reference_column] >= aligned["meeting_date"]).any():
+            raise RuntimeError(
+                f"{feature_column} was not aligned strictly before meeting_date"
+            )
+
+        observation_age_days = (
+            aligned["meeting_date"] - aligned[reference_column]
+        ).dt.days
+        stale = observation_age_days > BOND_FEATURE_MAX_AGE_DAYS
+        if stale.any():
+            stale_rows = aligned.loc[
+                stale, ["meeting_date", reference_column]
+            ].copy()
+            stale_rows["age_days"] = observation_age_days.loc[stale]
+            raise ValueError(
+                f"{feature_column} observations exceed the configured "
+                f"{BOND_FEATURE_MAX_AGE_DAYS}-day age limit:\n"
+                f"{stale_rows.to_string(index=False)}"
+            )
+
+        featured[feature_column] = aligned[feature_column].to_numpy()
+        featured[reference_column] = aligned[reference_column].to_numpy()
+
+    for yield_column, spread_column in TREASURY_FUNDS_SPREADS:
+        featured[spread_column] = (
+            featured[yield_column] - featured["rate_level"]
+        )
+
+    featured.attrs["bond_alignment"] = "latest observation strictly before meeting"
+    featured.attrs["bond_max_age_days"] = BOND_FEATURE_MAX_AGE_DAYS
+    return featured
+
+
 def _prior_nonhold_streak(decisions: "pd.Series") -> "pd.Series":
     """Return the consecutive non-hold streak known before each meeting."""
     encoded = decisions.astype("string").map({"cut": -1, "hold": 0, "hike": 1})
@@ -634,6 +745,18 @@ def validate_feature_panel(panel: "pd.DataFrame") -> None:
             | (validated[percentage_column] > 100)
         ).any():
             raise ValueError(f"Feature {percentage_column} must be between 0 and 100")
+    for market_column in (
+        *BOND_FEATURE_COLUMNS,
+        *TREASURY_FUNDS_SPREAD_COLUMNS,
+    ):
+        if (
+            (validated[market_column] < -20)
+            | (validated[market_column] > 30)
+        ).any():
+            raise ValueError(
+                f"Feature {market_column} falls outside the plausible "
+                "-20 to 30 percentage-point range"
+            )
     if (validated["abs_inflation_gap"] < 0).any():
         raise ValueError("abs_inflation_gap cannot be negative")
 
@@ -663,6 +786,10 @@ def validate_feature_panel(panel: "pd.DataFrame") -> None:
         "abs_inflation_gap": (
             validated["pce_yoy"] - INFLATION_TARGET_PERCENT
         ).abs(),
+        **{
+            spread_column: validated[yield_column] - validated["rate_level"]
+            for yield_column, spread_column in TREASURY_FUNDS_SPREADS
+        },
     }
     for feature_column, expected_values in expected_context.items():
         if feature_column not in FEATURE_COLUMNS:
@@ -686,6 +813,7 @@ def build_feature_panel() -> Path:
     panel = add_inflation_features(panel)
     panel = add_labour_features(panel)
     panel = add_policy_context_features(panel)
+    panel = add_bond_market_features(panel)
     panel = add_meeting_history_features(panel)
     feature_panel = select_model_columns(panel)
     validate_feature_panel(feature_panel)
