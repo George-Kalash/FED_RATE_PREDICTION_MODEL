@@ -56,6 +56,10 @@ MODEL_METRICS_PATH: Final = OUTPUTS / "metrics.json"
 MODEL_COEFFICIENTS_PATH: Final = OUTPUTS / "coefficients.csv"
 MODEL_PREDICTIONS_PATH: Final = OUTPUTS / "predictions.csv"
 PREDICTION_VISUALIZER_PATH: Final = OUTPUTS / "prediction_visualizer.ipynb"
+TREE_MODEL_METRICS_PATH: Final = OUTPUTS / "tree_model_metrics.json"
+TREE_MODEL_PREDICTIONS_PATH: Final = OUTPUTS / "tree_model_predictions.csv"
+TREE_MODEL_IMPORTANCE_PATH: Final = OUTPUTS / "tree_model_feature_importance.csv"
+TREE_MODEL_FACTOR_RANKINGS_PATH: Final = OUTPUTS / "tree_model_factor_rankings.csv"
 
 # Network configuration. Never put the actual API key in this file.
 FRED_API_KEY_ENV: Final = "FRED_API_KEY"
@@ -74,7 +78,7 @@ REQUEST_TIMEOUT_SECONDS: Final = 25
 
 # End-to-end pipeline behavior. Coverage scraping remains optional because it
 # does not feed the model and can be slow or blocked by third-party websites.
-PIPELINE_START_YEAR: Final = 1998
+PIPELINE_START_YEAR: Final = 1983
 PIPELINE_END_YEAR: Final = date.today().year
 PIPELINE_FRED_OBSERVATION_START: Final[str | None] = None
 PIPELINE_SCRAPE_COVERAGE: Final = False

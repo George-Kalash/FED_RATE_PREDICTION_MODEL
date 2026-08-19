@@ -159,6 +159,7 @@ FED_decision_predictor/
 |  |- clean.py                     # policy splice, macro alignment, labels
 |  |- features.py                  # leakage-controlled feature engineering
 |  |- model.py                     # hierarchical models and evaluation
+|  |- tree_model.py                # decision-tree/random-forest comparison
 |  |- pipeline.py                  # configured end-to-end orchestration
 |  |- clean_data_and_outputs.py    # remove generated files, preserve directories
 |  |- build_prediction_visualizer.py # executed prediction charts notebook
@@ -277,6 +278,7 @@ python3 pull_from_apis.py
 python3 clean.py
 python3 features.py
 python3 model.py
+python3 tree_model.py
 python3 build_prediction_visualizer.py
 python3 build_accuracy_report.py
 ```
@@ -289,6 +291,7 @@ Stage dependencies are strict:
 | `clean.py` | Complete raw inputs | `clean_panel.csv` |
 | `features.py` | Clean panel plus raw histories | `feature_panel.csv` |
 | `model.py` | Feature panel | Metrics, coefficients, predictions |
+| `tree_model.py` | Feature panel | Tree metrics, predictions, feature importances |
 | `build_prediction_visualizer.py` | Predictions and clean panel | Executed visualization notebook |
 | `build_accuracy_report.py` | Model outputs and feature panel | Notebook, report JSON, HTML |
 
@@ -608,6 +611,32 @@ Contains one row per meeting in the chronological holdout, including:
 - joint cut, hold, and hike probabilities;
 - obvious-cut signal and override flags; and
 - an override reason when the raw decision was changed.
+
+#### Tree-model comparison outputs
+
+Running `tree_model.py` creates four separate artifacts so it does not
+overwrite the hierarchical logistic-regression results:
+
+| File | Contents |
+|---|---|
+| `tree_model_metrics.json` | Training-CV selection scores, tuned parameters, holdout metrics, and 3x3 confusion matrices for both models |
+| `tree_model_predictions.csv` | Actual decisions, predictions, correctness flags, and cut/hold/hike probabilities for both models |
+| `tree_model_feature_importance.csv` | Decision-tree and random-forest impurity importances and ranks for every configured feature |
+| `tree_model_factor_rankings.csv` | Explicit top and bottom influence lists for each tree model |
+
+Both tree families use the same hierarchical structure and chronological split
+as `model.py`: a hold/change component, a cut/hike component trained only on
+historical changes, and training-selected decision and obvious-cut thresholds.
+The selected family is determined by forward out-of-fold training policy macro
+F1; the final holdout is used only for evaluation.
+
+Tree influence is the equal mean of the hold/change and conditional cut/hike
+components' mean decrease in impurity. The complete importance CSV also retains
+each component separately. Correlated features can divide or exchange this
+importance, particularly where both a Treasury yield and its spread to the
+funds rate are present. A zero importance means the fitted components did not
+split on the feature; it does not establish that the factor has no economic
+relationship with policy decisions.
 
 To print the latest saved headline metrics without additional dependencies:
 
