@@ -163,6 +163,7 @@ FED_decision_predictor/
 |  |- pipeline.py                  # configured end-to-end orchestration
 |  |- clean_data_and_outputs.py    # remove generated files, preserve directories
 |  |- build_prediction_visualizer.py # executed prediction charts notebook
+|  |- build_random_forest_visualizer.py # random-forest charts and importance
 |  |- build_accuracy_report.py     # notebook, JSON report, and HTML report
 |  |- check_links.py               # unfinished supplementary-link QA scaffold
 |  |- fed_rate_prediction_resources.csv
@@ -280,6 +281,7 @@ python3 features.py
 python3 model.py
 python3 tree_model.py
 python3 build_prediction_visualizer.py
+python3 build_random_forest_visualizer.py
 python3 build_accuracy_report.py
 ```
 
@@ -293,6 +295,7 @@ Stage dependencies are strict:
 | `model.py` | Feature panel | Metrics, coefficients, predictions |
 | `tree_model.py` | Feature panel | Tree metrics, predictions, feature importances |
 | `build_prediction_visualizer.py` | Predictions and clean panel | Executed visualization notebook |
+| `build_random_forest_visualizer.py` | Tree predictions, importances, and clean panel | Executed random-forest notebook |
 | `build_accuracy_report.py` | Model outputs and feature panel | Notebook, report JSON, HTML |
 
 ### Structured acquisition options
@@ -614,7 +617,7 @@ Contains one row per meeting in the chronological holdout, including:
 
 #### Tree-model comparison outputs
 
-Running `tree_model.py` creates four separate artifacts so it does not
+Running `tree_model.py` creates three separate artifacts so it does not
 overwrite the hierarchical logistic-regression results:
 
 | File | Contents |
@@ -624,19 +627,15 @@ overwrite the hierarchical logistic-regression results:
 | `tree_model_feature_importance.csv` | Decision-tree and random-forest impurity importances and ranks for every configured feature |
 | `tree_model_factor_rankings.csv` | Explicit top and bottom influence lists for each tree model |
 
-Both tree families use the same hierarchical structure and chronological split
-as `model.py`: a hold/change component, a cut/hike component trained only on
-historical changes, and training-selected decision and obvious-cut thresholds.
-The selected family is determined by forward out-of-fold training policy macro
-F1; the final holdout is used only for evaluation.
+Both classifiers use the same chronological train/test split as `model.py`.
+The selected model family is determined by training cross-validated macro F1;
+the final holdout is used only for evaluation.
 
-Tree influence is the equal mean of the hold/change and conditional cut/hike
-components' mean decrease in impurity. The complete importance CSV also retains
-each component separately. Correlated features can divide or exchange this
-importance, particularly where both a Treasury yield and its spread to the
-funds rate are present. A zero importance means the fitted components did not
-split on the feature; it does not establish that the factor has no economic
-relationship with policy decisions.
+Tree influence means mean decrease in impurity. Correlated features can divide
+or exchange this importance, particularly where both a Treasury yield and its
+spread to the funds rate are present. A zero importance in one fitted decision
+tree means that tree did not split on the feature; it does not establish that
+the factor has no economic relationship with policy decisions.
 
 To print the latest saved headline metrics without additional dependencies:
 
@@ -722,6 +721,28 @@ The builder validates source schemas, probability sums, unique meeting dates,
 the confusion-matrix total, and all notebook cell outputs. It refuses to create
 a partially executed notebook and tells you to run the upstream pipeline when
 the required artifacts are missing.
+
+### Random-forest visualizer
+
+After `tree_model.py` has refreshed its outputs, run:
+
+```bash
+python3 build_random_forest_visualizer.py
+```
+
+This creates the executed notebook:
+
+```text
+contents/outputs/random_forest_visualizer.ipynb
+```
+
+It reproduces the interest-rate path, unemployment path, and 3×3 confusion
+matrix using only `random_forest_*` prediction fields. Decision-tree columns are
+not loaded into the notebook data. A fourth chart ranks the 15 largest
+random-forest impurity-based feature importances, with the complete ranking
+available in `tree_model_feature_importance.csv`. The builder rejects stale
+importance artifacts whose features disagree with the current
+`FEATURE_COLUMNS` declaration.
 
 ## Supplementary scraping
 

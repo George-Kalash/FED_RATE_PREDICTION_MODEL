@@ -56,6 +56,7 @@ MODEL_METRICS_PATH: Final = OUTPUTS / "metrics.json"
 MODEL_COEFFICIENTS_PATH: Final = OUTPUTS / "coefficients.csv"
 MODEL_PREDICTIONS_PATH: Final = OUTPUTS / "predictions.csv"
 PREDICTION_VISUALIZER_PATH: Final = OUTPUTS / "prediction_visualizer.ipynb"
+RANDOM_FOREST_VISUALIZER_PATH: Final = OUTPUTS / "random_forest_visualizer.ipynb"
 TREE_MODEL_METRICS_PATH: Final = OUTPUTS / "tree_model_metrics.json"
 TREE_MODEL_PREDICTIONS_PATH: Final = OUTPUTS / "tree_model_predictions.csv"
 TREE_MODEL_IMPORTANCE_PATH: Final = OUTPUTS / "tree_model_feature_importance.csv"
@@ -78,7 +79,7 @@ REQUEST_TIMEOUT_SECONDS: Final = 25
 
 # End-to-end pipeline behavior. Coverage scraping remains optional because it
 # does not feed the model and can be slow or blocked by third-party websites.
-PIPELINE_START_YEAR: Final = 1983
+PIPELINE_START_YEAR: Final = 1994 # reson for specifically 1994: https://onlinelibrary.wiley.com/doi/full/10.1002/for.3144
 PIPELINE_END_YEAR: Final = date.today().year
 PIPELINE_FRED_OBSERVATION_START: Final[str | None] = None
 PIPELINE_SCRAPE_COVERAGE: Final = False
@@ -237,7 +238,7 @@ FRED_SERIES: Final[dict[str, FredSeriesSpec]] = {
 DATE_COLUMN: Final = "date"
 MEETING_DATE_COLUMN: Final = "meeting_date"
 INFLATION_TARGET_PERCENT: Final = 2.0
-RATE_CHANGE_TOLERANCE_BPS: Final = 0.5
+RATE_CHANGE_TOLERANCE_BPS: Final = 0.25
 DECISION_CLASSES: Final[tuple[str, ...]] = ("cut", "hold", "hike")
 POLICY_REGIMES: Final[tuple[str, ...]] = ("point_target", "target_range")
 PRIMARY_TARGET: Final = "is_change"
