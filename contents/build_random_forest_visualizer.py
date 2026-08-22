@@ -16,6 +16,7 @@ from config import (
     CLEAN_PANEL_PATH,
     DECISION_CLASSES,
     FEATURE_COLUMNS,
+    OUTPUTS,
     PROJECT_DIR,
     RANDOM_FOREST_VISUALIZER_PATH,
     TREE_MODEL_IMPORTANCE_PATH,
@@ -25,6 +26,13 @@ from config import (
 
 REPOSITORY_DIR = PROJECT_DIR.parent
 TOP_FEATURE_COUNT = 15
+PNG_DPI = 200
+CHART_PNG_PATHS = {
+    "interest_rate": OUTPUTS / "random_forest_interest_rate.png",
+    "unemployment": OUTPUTS / "random_forest_unemployment.png",
+    "confusion_matrix": OUTPUTS / "random_forest_confusion_matrix.png",
+    "feature_importance": OUTPUTS / "random_forest_feature_importance.png",
+}
 
 
 def load_random_forest_visualizer_data() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -222,7 +230,13 @@ def create_notebook(
             "contents = workspace / 'contents' if (workspace / 'contents').is_dir() else workspace\n"
             "if str(contents) not in sys.path:\n"
             "    sys.path.insert(0, str(contents))\n"
-            "from build_random_forest_visualizer import load_random_forest_visualizer_data\n\n"
+            "from build_random_forest_visualizer import (\n"
+            "    CHART_PNG_PATHS,\n"
+            "    PNG_DPI,\n"
+            "    load_random_forest_visualizer_data,\n"
+            ")\n\n"
+            "for chart_path in CHART_PNG_PATHS.values():\n"
+            "    chart_path.parent.mkdir(parents=True, exist_ok=True)\n\n"
             "plot_data, feature_importance = load_random_forest_visualizer_data()\n"
             "probability_columns = ['probability_cut', 'probability_hold', 'probability_hike']\n"
             "assert plot_data.meeting_date.is_unique\n"
@@ -285,6 +299,8 @@ def create_notebook(
             "ax.grid(axis='y', color=GRID, linewidth=0.8)\n"
             "ax.spines[['top', 'right']].set_visible(False)\n"
             "ax.legend(frameon=False, ncols=2, loc='upper left')\n"
+            "fig.savefig(CHART_PNG_PATHS['interest_rate'], dpi=PNG_DPI, "
+            "bbox_inches='tight', facecolor='white')\n"
             "plt.show()"
         ),
         nbformat.v4.new_markdown_cell(
@@ -316,6 +332,8 @@ def create_notebook(
             "ax.grid(axis='y', color=GRID, linewidth=0.8)\n"
             "ax.spines[['top', 'right']].set_visible(False)\n"
             "ax.legend(frameon=False, ncols=2, loc='upper right')\n"
+            "fig.savefig(CHART_PNG_PATHS['unemployment'], dpi=PNG_DPI, "
+            "bbox_inches='tight', facecolor='white')\n"
             "plt.show()"
         ),
         nbformat.v4.new_markdown_cell(
@@ -350,6 +368,8 @@ def create_notebook(
             "ax.grid(which='minor', color='white', linewidth=2)\n"
             "ax.tick_params(which='minor', bottom=False, left=False)\n"
             "ax.set_aspect('equal')\n"
+            "fig.savefig(CHART_PNG_PATHS['confusion_matrix'], dpi=PNG_DPI, "
+            "bbox_inches='tight', facecolor='white')\n"
             "plt.show()"
         ),
         nbformat.v4.new_markdown_cell(
@@ -375,6 +395,8 @@ def create_notebook(
             "ax.grid(axis='x', color=GRID, linewidth=0.8)\n"
             "ax.set_axisbelow(True)\n"
             "ax.spines[['top', 'right']].set_visible(False)\n"
+            "fig.savefig(CHART_PNG_PATHS['feature_importance'], dpi=PNG_DPI, "
+            "bbox_inches='tight', facecolor='white')\n"
             "plt.show()"
         ),
         nbformat.v4.new_markdown_cell("### 6. Validate plotted results"),
@@ -408,6 +430,9 @@ def create_notebook(
 
 def execute_and_save_notebook(notebook: nbformat.NotebookNode) -> Path:
     """Execute every cell and atomically save the completed notebook."""
+    for chart_path in CHART_PNG_PATHS.values():
+        chart_path.unlink(missing_ok=True)
+
     execution_environment = os.environ.copy()
     interpreter_directory = str(Path(sys.executable).resolve().parent)
     execution_environment["PATH"] = (
@@ -441,6 +466,14 @@ def execute_and_save_notebook(notebook: nbformat.NotebookNode) -> Path:
         raise RuntimeError(
             f"Expected four rendered random-forest charts, found {chart_outputs}"
         )
+
+    png_signature = b"\x89PNG\r\n\x1a\n"
+    for chart_name, chart_path in CHART_PNG_PATHS.items():
+        if not chart_path.is_file():
+            raise RuntimeError(f"Notebook did not save {chart_name} PNG: {chart_path}")
+        with chart_path.open("rb") as chart_file:
+            if chart_file.read(len(png_signature)) != png_signature:
+                raise RuntimeError(f"Invalid PNG generated for {chart_name}: {chart_path}")
 
     RANDOM_FOREST_VISUALIZER_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -476,6 +509,8 @@ def main() -> None:
         "Rendered charts: interest rate, unemployment, 3x3 confusion matrix, "
         "and feature importance"
     )
+    for chart_path in CHART_PNG_PATHS.values():
+        print(f"Saved PNG to {chart_path}")
 
 
 if __name__ == "__main__":

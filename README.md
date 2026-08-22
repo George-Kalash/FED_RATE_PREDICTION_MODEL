@@ -109,6 +109,7 @@ and feature-importance chart.
 | `contents/outputs/tree_model_predictions.csv` | Meeting-level random-forest predictions and probabilities |
 | `contents/outputs/tree_model_feature_importance.csv` | Random-forest feature importances |
 | `contents/outputs/tree_model_factor_rankings.csv` | Most and least influential features |
+| `contents/outputs/random_forest_*.png` | Four exported charts from the visualization notebook |
 | `contents/outputs/random_state_cv_results.csv` | Per-seed and per-fold random-forest metrics |
 | `contents/outputs/random_state_holdout_predictions.csv` | Meeting-level seed-sensitivity predictions |
 
